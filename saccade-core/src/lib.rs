@@ -1,11 +1,42 @@
 use candle_core::{CustomOp1, CpuStorage, Layout, Result, Shape, Tensor};
 use rayon::prelude::*;
 
-/// Core configuration profile containing global variance threshold pools
+/// A function pointer defining the dynamic strategy used to calculate a complexity score for a single token slice.
+pub type HeuristicFn = fn(&[half::f16]) -> f32;
+
+/// Core configuration profile containing global variance threshold pools and dynamic routing strategies
 pub struct SaccadeConfig {
     pub t4: f32,
     pub t8: f32,
     pub block_size: usize,
+    /// The dynamic complexity metric calculation function to use per-token (e.g., Variance or L2 Norm).
+    pub heuristic: HeuristicFn,
+}
+
+/// Computes the statistical variance of the token activations.
+/// Isolates local volatility by explicitly tracking the mean. Recommended for Saccade.
+pub fn variance_heuristic(token_slice: &[half::f16]) -> f32 {
+    let hidden_dim = token_slice.len() as f32;
+    let mut sum = 0.0f32;
+    let mut sum_sq = 0.0f32;
+    for &val in token_slice.iter() {
+        let v_f32 = val.to_f32();
+        sum += v_f32;
+        sum_sq += v_f32 * v_f32;
+    }
+    let mean = sum / hidden_dim;
+    (sum_sq / hidden_dim) - (mean * mean)
+}
+
+/// Computes the L2 Norm (Euclidean magnitude) of the token activations.
+/// This measures absolute magnitude rather than volatility from the mean.
+pub fn l2_norm_heuristic(token_slice: &[half::f16]) -> f32 {
+    let mut sum_sq = 0.0f32;
+    for &val in token_slice.iter() {
+        let v_f32 = val.to_f32();
+        sum_sq += v_f32 * v_f32;
+    }
+    sum_sq.sqrt()
 }
 
 /// Persistent in-memory storage layout for an optimized Saccade linear projection.
@@ -93,20 +124,12 @@ impl CustomOp1 for SaccadeLinearOp {
             let act_offset = t * hidden_dim;
             let current_token_slice = &raw_activations[act_offset..act_offset + hidden_dim];
 
-            // 1. Compute Causal Activation Variance entirely on-chip inside CPU registers
-            let mut sum = 0.0f32;
-            let mut sum_sq = 0.0f32;
-            for &val in current_token_slice.iter() {
-                let v_f32 = val.to_f32();
-                sum += v_f32;
-                sum_sq += v_f32 * v_f32;
-            }
-            let mean = sum / (hidden_dim as f32);
-            let variance = (sum_sq / (hidden_dim as f32)) - (mean * mean);
+            // 1. Compute Complexity Heuristic entirely on-chip inside CPU registers
+            let complexity_score = (self.config.heuristic)(current_token_slice);
 
             // 2. Evaluate frozen complexity thresholds to establish the dynamic execution path
-            let use_delta_q8 = variance >= self.config.t4 && variance < self.config.t8;
-            let use_delta_fp16 = variance >= self.config.t8;
+            let use_delta_q8 = complexity_score >= self.config.t4 && complexity_score < self.config.t8;
+            let use_delta_fp16 = complexity_score >= self.config.t8;
 
             // 3. Perform Fused Matrix Multiplication across rows of the projection weights
             // Parallelize computation across rows using Rayon as instructed

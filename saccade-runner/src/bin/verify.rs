@@ -47,6 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         t4: 1.0,
         t8: 5.0,
         block_size: 16,
+        heuristic: saccade_core::variance_heuristic,
     };
 
     let saccade_linear = SaccadeLinearOp {

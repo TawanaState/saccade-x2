@@ -37,13 +37,37 @@ The magic behind Saccade's computational routing is the **Global Activation Vari
 
 These thresholds represent absolute structural thresholds defined during your calibration phases:
 
-```rust
-use saccade_core::SaccadeConfig;
+### Using Custom Developer Heuristics
 
+The evaluation architecture is built for maximum developer friendliness, allowing researchers to inject completely customized mathematical routing constraints.
+
+By default, we supply `variance_heuristic` and `l2_norm_heuristic`. You can apply your own `fn(&[half::f16]) -> f32` functions.
+
+```rust
+use saccade_core::{SaccadeConfig, variance_heuristic};
+
+// Option A: Use built-in heuristics
 let config = SaccadeConfig {
-    t4: 2.0, // Variance threshold to trigger sparse 8-bit updates
-    t8: 8.0, // Variance threshold to trigger dense FP16 updates
+    t4: 2.0, // Threshold to trigger sparse 8-bit updates
+    t8: 8.0, // Threshold to trigger dense FP16 updates
     block_size: 16,
+    heuristic: variance_heuristic,
+};
+
+// Option B: Write your own totally dynamic routing calibration function!
+fn my_custom_activation_routing(tokens: &[half::f16]) -> f32 {
+    let mut max_val = 0.0f32;
+    for &t in tokens {
+        if t.to_f32().abs() > max_val { max_val = t.to_f32().abs(); }
+    }
+    max_val // Route dynamically off the absolute maximum spike!
+}
+
+let custom_config = SaccadeConfig {
+    t4: 15.0,
+    t8: 30.0,
+    block_size: 16,
+    heuristic: my_custom_activation_routing,
 };
 ```
 
