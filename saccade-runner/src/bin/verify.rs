@@ -91,5 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("High-variance output shape: {:?}", out_high.shape());
 
     println!("Validation successful.");
+
+    // Clean up mock artifact
+    let _ = std::fs::remove_file(model_path);
     Ok(())
 }
