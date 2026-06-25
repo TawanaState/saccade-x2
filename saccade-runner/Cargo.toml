@@ -1,0 +1,12 @@
+[package]
+name = "saccade-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+candle-core = "0.4.1"
+candle-nn = "0.4.1"
+candle-transformers = "0.4.1"
+half = "2.3.1"
+saccade-core = { path = "../saccade-core" }
+safetensors = "0.4.5"

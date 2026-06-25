@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "saccade-core",
+    "saccade-runner"
+]
+resolver = "2"
