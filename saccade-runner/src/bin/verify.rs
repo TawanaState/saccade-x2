@@ -24,15 +24,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut delta_row_ptrs: Vec<u32> = vec![0; out_features + 1];
     let mut delta_col_indices: Vec<u32> = vec![];
     let mut delta_values: Vec<u8> = vec![];
-
+    
     // Add non-zero sparse corrections (e.g. at row 0 col 0, row 0 col 15)
-    delta_row_ptrs[1] = 2;
+    delta_row_ptrs[1] = 2; 
     for i in 2..=out_features {
         delta_row_ptrs[i] = 2; // the rest of rows are empty
     }
     delta_col_indices.push(0);
     delta_values.push(10i8 as u8);
-
+    
     delta_col_indices.push(15);
     delta_values.push(-5i8 as u8);
 
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loaded_tensors = candle_core::safetensors::load(model_path, &device)?;
     let loaded_packed_base = loaded_tensors.get("packed_base").unwrap().clone();
     let loaded_scale_base = loaded_tensors.get("scale_base").unwrap().clone();
-
+    
     let sparse_delta_q8 = Some(SparseDeltaMatrix {
         row_ptrs: loaded_tensors.get("delta_row_ptrs").unwrap().clone(),
         col_indices: loaded_tensors.get("delta_col_indices").unwrap().clone(),

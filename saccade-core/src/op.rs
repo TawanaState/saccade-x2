@@ -158,7 +158,7 @@ impl CustomOp1 for SaccadeLinearOp {
                         dot_accumulator += current_token_slice[k_unpacked_base + idx].to_f32() * base_weight;
                     }
                 }
-
+                
                 // Add sparse delta updates if thresholds match using CSR traversal
                 if use_delta_q8 {
                     if let Some(ref csr) = csr_q8 {

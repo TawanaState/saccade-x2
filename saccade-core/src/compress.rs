@@ -30,7 +30,7 @@ pub fn compress_tensor_to_saccade(
     let mut delta_row_ptrs = Vec::with_capacity(out_features + 1);
     let mut delta_col_indices = Vec::new();
     let mut delta_values = Vec::new();
-
+    
     // First, we need to collect the raw errors to find the global maximum error
     // for quantization.
     let mut max_error_abs = 0.0f32;
@@ -85,7 +85,7 @@ pub fn compress_tensor_to_saccade(
 
     // Now construct the sparse structures
     let delta_scale = if max_error_abs > 0.0 { max_error_abs / 127.0 } else { 1.0 };
-
+    
     let mut current_ptr = 0u32;
     for row in 0..out_features {
         delta_row_ptrs.push(current_ptr);
@@ -95,7 +95,7 @@ pub fn compress_tensor_to_saccade(
                 delta_col_indices.push(col as u32);
                 let q_err = (err / delta_scale).round() as i32;
                 let q_err_i8 = q_err.max(-128).min(127) as i8;
-                // store as u8 for candle tensor (no i8 support in candle commonly),
+                // store as u8 for candle tensor (no i8 support in candle commonly), 
                 // we will interpret it as i8.
                 delta_values.push(q_err_i8 as u8);
                 current_ptr += 1;
@@ -113,13 +113,13 @@ pub fn compress_tensor_to_saccade(
     let mut compressed_state = HashMap::new();
     compressed_state.insert("packed_base".to_string(), packed_base);
     compressed_state.insert("scale_base".to_string(), scale_base);
-
+    
     if current_ptr > 0 {
         let row_ptrs_tensor = Tensor::from_vec(delta_row_ptrs, (out_features + 1,), device)?;
         let col_indices_tensor = Tensor::from_vec(delta_col_indices, (current_ptr as usize,), device)?;
         let values_tensor = Tensor::from_vec(delta_values, (current_ptr as usize,), device)?;
         let scale_tensor = Tensor::from_vec(vec![half::f16::from_f32(delta_scale)], (1,), device)?;
-
+        
         compressed_state.insert("delta_row_ptrs".to_string(), row_ptrs_tensor);
         compressed_state.insert("delta_col_indices".to_string(), col_indices_tensor);
         compressed_state.insert("delta_values".to_string(), values_tensor);

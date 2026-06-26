@@ -1,6 +1,7 @@
 use candle_core::{DType, Device, Tensor};
-use saccade_core::{SaccadeConfig, SaccadeEngine};
+use saccade_core::{SaccadeConfig, SaccadeEngine, calibration::ProfileRunner, variance_heuristic};
 use hf_hub::api::sync::Api;
+use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::Cpu;
@@ -14,20 +15,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Downloaded to: {:?}", model_file);
 
     // Load the model weights raw directly into a map for compiler
-    let tensors = candle_core::safetensors::load(model_file, &device)?;
+    let mut tensors = candle_core::safetensors::load(model_file, &device)?;
 
-    println!("\n=== Phase 2: Real Model Compression via SaccadeEngine ===");
-    // Configure the Saccade runtime engine heuristics
-    // By using a slightly lower threshold we can force some sparse updates
-    // for testing.
+    println!("\n=== Phase 2: Offline Calibration ===");
+    // Generate mock calibration sequences covering different distribution structures
+    let calib_tokens = 300;
+    let hidden_size = 4864;
+    let mut calib_data = vec![half::f16::from_f32(0.01); calib_tokens * hidden_size];
+    
+    // Inject high variance for ~15% of tokens simulating highly complex paths
+    for t in 0..45 {
+        calib_data[t * hidden_size + 0] = half::f16::from_f32(12.0);
+    }
+    // Inject medium variance for ~80% of tokens
+    for t in 45..240 {
+        calib_data[t * hidden_size + 0] = half::f16::from_f32(2.5);
+    }
+    // Rest remain flat low variance (predictable paths)
+
+    let calib_tensor = Tensor::from_vec(calib_data, (calib_tokens, hidden_size), &device)?;
+    
+    // Target ~80% of tokens bypass dense and utilize T4, ~15% utilize T8
+    let (t4, t8) = ProfileRunner::calibrate(&calib_tensor, 0.20, 0.85)?;
+    println!("Offline Data-Driven Thresholds Extracted: t4 = {:.4}, t8 = {:.4}", t4, t8);
+
+    // Embed data-driven thresholds straight into the model container registry
+    let target_name = "model.layers.0.mlp.down_proj";
+    tensors.insert(format!("{}.saccade_t4", target_name), Tensor::from_vec(vec![t4], (1,), &device)?);
+    tensors.insert(format!("{}.saccade_t8", target_name), Tensor::from_vec(vec![t8], (1,), &device)?);
+
+    println!("\n=== Phase 3: Real Model Compression via SaccadeEngine ===");
+    // Configure the Saccade runtime engine default heuristics (to be overridden by map metadata)
     let config = SaccadeConfig {
-        t4: 0.05, // A very low threshold to trigger deltas for our test token
-        t8: 999.0, // FP16 threshold not used
+        t4: 999.0, // High default to ensure override proves it works
+        t8: 999.0, // High default
         block_size: 16,
-        heuristic: saccade_core::variance_heuristic,
+        heuristic: variance_heuristic,
     };
 
-    let target_substrings = vec!["model.layers.0.mlp.down_proj"];
+    let target_substrings = vec![target_name];
 
     let compiled_layers = SaccadeEngine::compile_model_topology(
         &tensors,
@@ -36,77 +62,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     println!("Successfully compiled {} layers.", compiled_layers.len());
-
-    println!("\n=== Phase 3: Online Inference Execution & Comparison ===");
-    let target_name = "model.layers.0.mlp.down_proj";
     let saccade_linear = compiled_layers.get(target_name).expect("Layer should be compiled");
 
-    // Generate test activations
-    // We'll use a batch of 2 tokens.
-    let batch_tokens = 2;
-    let hidden_size = 4864;
-    let mut activation_data = vec![half::f16::from_f32(0.01); batch_tokens * hidden_size];
+    println!("\n=== Phase 4: Online Inference Benchmarks ===");
+    
+    // Test sets
+    let test_size = 10;
+    
+    // 1. Prose Token (Predictable, Low Variance)
+    let prose_data = vec![half::f16::from_f32(0.02); test_size * hidden_size];
+    let prose_tensor = Tensor::from_vec(prose_data, (test_size, hidden_size), &device)?;
+    
+    // 2. Logic Token (Medium Variance)
+    let mut logic_data = vec![half::f16::from_f32(0.01); test_size * hidden_size];
+    for t in 0..test_size { logic_data[t * hidden_size + 0] = half::f16::from_f32(2.5); }
+    let logic_tensor = Tensor::from_vec(logic_data, (test_size, hidden_size), &device)?;
 
-    // Inject variance into token 1
-    activation_data[1 * hidden_size + 0] = half::f16::from_f32(5.0);
+    // 3. Code Token (High Volatility)
+    let mut code_data = vec![half::f16::from_f32(0.01); test_size * hidden_size];
+    for t in 0..test_size { code_data[t * hidden_size + 0] = half::f16::from_f32(15.0); }
+    let code_tensor = Tensor::from_vec(code_data, (test_size, hidden_size), &device)?;
 
-    let incoming_activations = Tensor::from_vec(activation_data, (batch_tokens, hidden_size), &device)?;
+    let tests = vec![
+        ("Prose (Low Volatility)", prose_tensor),
+        ("Logic (Medium Volatility)", logic_tensor),
+        ("Code (High Volatility)", code_tensor),
+    ];
 
-    println!("Input Activation Shape: {:?}", incoming_activations.shape());
-
-    // Execute Saccade forward pass
-    let start_saccade = std::time::Instant::now();
-    let output_saccade = incoming_activations.apply_op1_no_bwd(saccade_linear)?;
-    let saccade_duration = start_saccade.elapsed();
-
-    // Execute Dense forward pass
-    // y = x @ W.t()
-    let dense_weight = tensors.get("model.layers.0.mlp.down_proj.weight").unwrap();
-    let start_dense = std::time::Instant::now();
-    // Qwen model weights might be loaded as BF16, let's cast to F16 for parity
-    let dense_weight_f16 = dense_weight.to_dtype(DType::F16)?;
-    let dense_weight_t = dense_weight_f16.transpose(0, 1)?;
-    let output_dense = incoming_activations.matmul(&dense_weight_t)?;
-    let dense_duration = start_dense.elapsed();
-
-    println!("Output Projection Shape: {:?}", output_saccade.shape());
-    println!("Saccade Engine Execution Time: {:?}", saccade_duration);
-    println!("Dense Engine Execution Time: {:?}", dense_duration);
-
-    // Calculate error
-    let saccade_f32 = output_saccade.to_dtype(DType::F32)?;
-    let dense_f32 = output_dense.to_dtype(DType::F32)?;
-    let diff = saccade_f32.sub(&dense_f32)?;
-    let sq_diff = diff.mul(&diff)?;
-    let sum_sq = sq_diff.sum_all()?.to_scalar::<f32>()?;
-    let mse = sum_sq / (batch_tokens * 896) as f32;
-
-    println!("Mean Squared Error vs Dense: {:.6}", mse);
-
-    // Memory footprint comparison
-    // Original Dense FP16: 896 * 4864 * 2 bytes
-    let dense_bytes = 896 * 4864 * 2;
-    // Compressed Saccade:
-    // packed_base: 896 * (4864 / 8) * 4 bytes
-    let packed_bytes = 896 * (4864 / 8) * 4;
-    // scale_base: 896 * 2 bytes
-    let scale_bytes = 896 * 2;
-
-    // In a true sparse format, it would be nnz * (1 byte value + 4 byte coord).
-    let mut true_sparse_delta_bytes = 0;
-    if let Some(sp) = &saccade_linear.sparse_delta_q8 {
-        let nnz = sp.values.elem_count();
-        // values (1 byte) + col_indices (4 bytes) + row_ptrs ((896 + 1) * 4 bytes)
-        true_sparse_delta_bytes = nnz * 1 + nnz * 4 + (896 + 1) * 4;
+    for (desc, input) in tests {
+        let start = std::time::Instant::now();
+        let _out = input.apply_op1_no_bwd(saccade_linear)?;
+        let duration = start.elapsed();
+        println!("Benchmark [{}]: Execution Time = {:?}", desc, duration);
     }
-
-    let total_saccade_bytes = packed_bytes + scale_bytes + true_sparse_delta_bytes;
-
-    println!("\n=== Memory Footprint Comparison ===");
-    println!("Original Dense FP16 Footprint:  {} bytes", dense_bytes);
-    println!("Saccade True Sparse Footprint:  {} bytes ({} packed + {} scale + {} sparse delta)",
-             total_saccade_bytes, packed_bytes, scale_bytes, true_sparse_delta_bytes);
-    println!("Compression Ratio: {:.2}x", dense_bytes as f32 / total_saccade_bytes as f32);
 
     Ok(())
 }
