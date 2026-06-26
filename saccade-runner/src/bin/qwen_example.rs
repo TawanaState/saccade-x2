@@ -2,7 +2,9 @@ use candle_core::{DType, Device, Tensor};
 use saccade_core::{SaccadeConfig, SaccadeEngine, calibration::ProfileRunner, variance_heuristic};
 use hf_hub::api::sync::Api;
 
-// Tracks per-token routing decisions for BPT calculation.
+/// Tracks per-token routing decisions for dynamic BPT calculation.
+/// Each token is classified into one of three precision tiers based on
+/// its activation variance relative to the calibrated thresholds.
 struct RouteStats {
     base_only: usize,
     delta_q8: usize,
@@ -41,6 +43,9 @@ impl RouteStats {
         self.base_only + self.delta_q8 + self.delta_fp16
     }
 
+    /// Computes the average bits-per-token across the routing distribution.
+    /// Base-only tokens cost 4 bits/weight; delta tokens add the sparse CSR overhead
+    /// proportional to the number of non-zero correction entries.
     fn avg_bpt(&self, nnz: usize, total_params: usize) -> f32 {
         let total = self.total() as f32;
         if total == 0.0 {
@@ -72,9 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ----------------------------------------------------------------
     // Phase 1: Model Acquisition
     // ----------------------------------------------------------------
-    println!("=== Phase 1: Downloading Qwen2-0.5B-Instruct Model ===");
+    println!("=== Phase 1: Downloading Qwen2-1.5B-Instruct Model ===");
     let api = Api::new()?;
-    let repo = api.model("Qwen/Qwen2-0.5B-Instruct".to_string());
+    let repo = api.model("Qwen/Qwen2-1.5B-Instruct".to_string());
     let model_file = repo.get("model.safetensors")?;
     println!("Downloaded to: {:?}", model_file);
 
@@ -85,35 +90,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ----------------------------------------------------------------
     println!("\n=== Phase 2: Offline Calibration ===");
 
-    let calib_tokens = 300;
-    let hidden_size = 4864;
+    let target_name = "model.layers.0.mlp.down_proj";
 
-    // Build calibration data with variance spread across the full hidden dimension
-    // rather than concentrating signal in a single index.
+    // Dynamically read the weight dimensions from the actual model tensor
+    // rather than hardcoding them — this adapts to any Qwen variant.
+    let target_weight = tensors
+        .get(&format!("{}.weight", target_name))
+        .expect("Target weight must exist in model");
+    let target_dims = target_weight.shape().dims();
+    let hidden_size = target_dims[1]; // in_features of down_proj = intermediate_size
+    println!("Target layer: {} ({}x{})", target_name, target_dims[0], target_dims[1]);
+
+    let calib_tokens = 300;
+
+    // Calibration data with variance spread across the full hidden dimension.
+    // Three bands simulate the expected activation distribution in production:
+    //   - 15% high-variance (code-like tokens)
+    //   - 65% medium-variance (reasoning tokens)
+    //   - 20% low-variance (predictable prose)
     let mut calib_data = vec![half::f16::from_f32(0.01); calib_tokens * hidden_size];
 
-    // High-variance band: ~15% of tokens — alternating large amplitudes across all dims
     for t in 0..45 {
         for h in 0..hidden_size {
             let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
             calib_data[t * hidden_size + h] = half::f16::from_f32(sign * 0.65);
         }
     }
-    // Medium-variance band: ~65% of tokens
     for t in 45..240 {
         for h in 0..hidden_size {
             let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
             calib_data[t * hidden_size + h] = half::f16::from_f32(sign * 0.12);
         }
     }
-    // Remaining 60 tokens stay flat at 0.01 (low variance)
 
     let calib_tensor = Tensor::from_vec(calib_data, (calib_tokens, hidden_size), &device)?;
-
     let (t4, t8) = ProfileRunner::calibrate(&calib_tensor, 0.20, 0.85)?;
     println!("Extracted thresholds: t4 = {:.6}, t8 = {:.6}", t4, t8);
 
-    let target_name = "model.layers.0.mlp.down_proj";
     tensors.insert(
         format!("{}.saccade_t4", target_name),
         Tensor::from_vec(vec![t4], (1,), &device)?,
@@ -136,7 +149,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let target_substrings = vec![target_name];
-
     let compiled_layers = SaccadeEngine::compile_model_topology(&tensors, &target_substrings, config)?;
     println!("Compiled {} layer(s).", compiled_layers.len());
 
@@ -144,7 +156,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(target_name)
         .expect("Target layer must be compiled");
 
-    // Extract sparse NNZ count for BPT calculation
     let nnz = saccade_linear
         .sparse_delta_q8
         .as_ref()
@@ -160,22 +171,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let active_t4 = saccade_linear.config.t4;
     let active_t8 = saccade_linear.config.t8;
 
-    println!(
-        "Active thresholds -> t4: {:.6}, t8: {:.6}",
-        active_t4, active_t8
-    );
+    println!("Active thresholds -> t4: {:.6}, t8: {:.6}", active_t4, active_t8);
     println!(
         "Sparse delta NNZ: {} / {} total params ({:.2}% sparsity)",
-        nnz,
-        total_params,
-        if total_params > 0 {
-            (1.0 - (nnz as f64 / total_params as f64)) * 100.0
-        } else {
-            0.0
-        }
+        nnz, total_params,
+        if total_params > 0 { (1.0 - (nnz as f64 / total_params as f64)) * 100.0 } else { 0.0 }
     );
 
-    // Keep the original weight tensor for the vanilla baseline
+    // Retain the original dense weight for vanilla baseline comparisons
     let original_weight = tensors
         .get(&format!("{}.weight", target_name))
         .expect("Original weight tensor must exist")
@@ -186,130 +189,174 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ----------------------------------------------------------------
     println!("\n=== Phase 4: Constructing Test Inputs ===");
 
-    let test_size = 10;
     let hidden_dim = saccade_linear.in_features;
 
-    // Prose: flat distribution — all values identical => variance ~ 0
-    let prose_data = vec![half::f16::from_f32(0.02); test_size * hidden_dim];
-    let prose_tensor = Tensor::from_vec(prose_data.clone(), (test_size, hidden_dim), &device)?;
+    // Test tokens designed with dimensionally-spread variance so the heuristic
+    // can accurately classify them. Single-index variance injection (prior bug)
+    // produced near-zero variance across 4,864 dimensions.
 
-    // Logic: alternating moderate amplitudes => medium variance
-    let mut logic_data = vec![half::f16::from_f32(0.0); test_size * hidden_dim];
-    for t in 0..test_size {
-        for h in 0..hidden_dim {
-            let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
-            logic_data[t * hidden_dim + h] = half::f16::from_f32(sign * 0.12);
-        }
+    // Prose: uniform values => variance ≈ 0 => routes to base-only
+    let prose_data_1 = vec![half::f16::from_f32(0.02); hidden_dim];
+
+    // Logic: alternating ±0.12 => medium variance => routes to Q8 delta
+    let mut logic_data_1 = vec![half::f16::from_f32(0.0); hidden_dim];
+    for h in 0..hidden_dim {
+        let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
+        logic_data_1[h] = half::f16::from_f32(sign * 0.12);
     }
-    let logic_tensor = Tensor::from_vec(logic_data.clone(), (test_size, hidden_dim), &device)?;
 
-    // Code: high-amplitude oscillations => high variance
-    let mut code_data = vec![half::f16::from_f32(0.0); test_size * hidden_dim];
-    for t in 0..test_size {
-        for h in 0..hidden_dim {
-            let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
-            code_data[t * hidden_dim + h] = half::f16::from_f32(sign * 0.65);
-        }
+    // Code: alternating ±0.65 => high variance => routes to FP16/fallback delta
+    let mut code_data_1 = vec![half::f16::from_f32(0.0); hidden_dim];
+    for h in 0..hidden_dim {
+        let sign = if h % 2 == 0 { 1.0 } else { -1.0 };
+        code_data_1[h] = half::f16::from_f32(sign * 0.65);
     }
-    let code_tensor = Tensor::from_vec(code_data.clone(), (test_size, hidden_dim), &device)?;
 
-    // Verify routing classification
-    let prose_routes = RouteStats::classify(&prose_data, hidden_dim, test_size, active_t4, active_t8);
-    let logic_routes = RouteStats::classify(&logic_data, hidden_dim, test_size, active_t4, active_t8);
-    let code_routes = RouteStats::classify(&code_data, hidden_dim, test_size, active_t4, active_t8);
+    // Verify routing classification on single tokens
+    let prose_routes_1 = RouteStats::classify(&prose_data_1, hidden_dim, 1, active_t4, active_t8);
+    let logic_routes_1 = RouteStats::classify(&logic_data_1, hidden_dim, 1, active_t4, active_t8);
+    let code_routes_1 = RouteStats::classify(&code_data_1, hidden_dim, 1, active_t4, active_t8);
 
-    println!(
-        "  Prose routing:  base={}, q8={}, fp16={}",
-        prose_routes.base_only, prose_routes.delta_q8, prose_routes.delta_fp16
-    );
-    println!(
-        "  Logic routing:  base={}, q8={}, fp16={}",
-        logic_routes.base_only, logic_routes.delta_q8, logic_routes.delta_fp16
-    );
-    println!(
-        "  Code  routing:  base={}, q8={}, fp16={}",
-        code_routes.base_only, code_routes.delta_q8, code_routes.delta_fp16
-    );
+    println!("  Prose routing:  base={}, q8={}, fp16={}", prose_routes_1.base_only, prose_routes_1.delta_q8, prose_routes_1.delta_fp16);
+    println!("  Logic routing:  base={}, q8={}, fp16={}", logic_routes_1.base_only, logic_routes_1.delta_q8, logic_routes_1.delta_fp16);
+    println!("  Code  routing:  base={}, q8={}, fp16={}", code_routes_1.base_only, code_routes_1.delta_q8, code_routes_1.delta_fp16);
 
-    let test_inputs = vec![
-        ("Prose (Low Volatility)", &prose_tensor, &prose_data, &prose_routes),
-        ("Logic (Medium Volatility)", &logic_tensor, &logic_data, &logic_routes),
-        ("Code  (High Volatility)", &code_tensor, &code_data, &code_routes),
-    ];
+    // Build batched (GEMM) and single-token (GEMV) tensors
+    let gemm_batch = 10;
+    let gemv_iters = 50; // Simulate 50-step autoregressive decode
 
-    // ----------------------------------------------------------------
-    // Phase 5: Run 1 — Vanilla Dense FP16 Baseline
-    // ----------------------------------------------------------------
-    println!("\n=== Phase 5: Run 1 — Vanilla Dense FP16 Baseline ===");
-    println!("Executing standard Y = X * W^T using native Candle matmul.\n");
+    // GEMM tensors: 10 tokens batched
+    let prose_gemm = Tensor::from_vec(prose_data_1.repeat(gemm_batch), (gemm_batch, hidden_dim), &device)?;
+    let logic_gemm = Tensor::from_vec(logic_data_1.repeat(gemm_batch), (gemm_batch, hidden_dim), &device)?;
+    let code_gemm = Tensor::from_vec(code_data_1.repeat(gemm_batch), (gemm_batch, hidden_dim), &device)?;
 
+    // GEMV tensors: single token
+    let prose_gemv = Tensor::from_vec(prose_data_1.clone(), (1, hidden_dim), &device)?;
+    let logic_gemv = Tensor::from_vec(logic_data_1.clone(), (1, hidden_dim), &device)?;
+    let code_gemv = Tensor::from_vec(code_data_1.clone(), (1, hidden_dim), &device)?;
+
+    let prose_routes_b = RouteStats::classify(&prose_data_1.repeat(gemm_batch), hidden_dim, gemm_batch, active_t4, active_t8);
+    let logic_routes_b = RouteStats::classify(&logic_data_1.repeat(gemm_batch), hidden_dim, gemm_batch, active_t4, active_t8);
+    let code_routes_b = RouteStats::classify(&code_data_1.repeat(gemm_batch), hidden_dim, gemm_batch, active_t4, active_t8);
+
+    // Prepare vanilla baseline
     let weight_f16 = original_weight.to_dtype(DType::F16)?;
     let weight_t = weight_f16.t()?;
 
     let vanilla_mem_bytes = {
         let w_dims = weight_f16.dims();
-        w_dims[0] * w_dims[1] * 2 // f16 = 2 bytes each
+        w_dims[0] * w_dims[1] * 2
     };
+    let saccade_base_bytes = total_params / 2;
+    let saccade_scale_bytes = saccade_linear.out_features * 2;
+    let saccade_delta_bytes = nnz * (4 + 1)
+        + (saccade_linear.out_features + 1) * 4
+        + 2;
+    let saccade_total_bytes = saccade_base_bytes + saccade_scale_bytes + saccade_delta_bytes;
 
-    for &(desc, ref input, _, _) in &test_inputs {
+    // ================================================================
+    // Phase 5: GEMM Benchmark (batch=10, matrix-matrix multiply)
+    //
+    // This scenario represents prefill / prompt encoding where multiple
+    // tokens are processed simultaneously. Dense FP16 matmul is highly
+    // optimized for this layout (parallel, compute-heavy). Saccade's
+    // advantage here is memory footprint, not raw throughput.
+    // ================================================================
+    println!("\n=== Phase 5: GEMM Benchmark (batch={}) ===", gemm_batch);
+    println!("Matrix-matrix multiply — favors dense FP16 parallelism.\n");
+
+    let gemm_tests = vec![
+        ("Prose (Low Volatility)", &prose_gemm, &prose_routes_b),
+        ("Logic (Medium Volatility)", &logic_gemm, &logic_routes_b),
+        ("Code  (High Volatility)", &code_gemm, &code_routes_b),
+    ];
+
+    // Vanilla GEMM
+    for &(desc, ref input, _) in &gemm_tests {
         let input_f16 = input.to_dtype(DType::F16)?;
-
-        // Warm-up pass
-        let _ = input_f16.matmul(&weight_t)?;
-
+        let _ = input_f16.matmul(&weight_t)?; // warm-up
         let start = std::time::Instant::now();
         let _out = input_f16.matmul(&weight_t)?;
         let elapsed = start.elapsed();
-
-        let tokens_per_sec = test_size as f64 / elapsed.as_secs_f64();
         println!(
-            "  [Vanilla] {:<30} {:>9.3}ms  ({:.0} tok/s)  BPT: 16.00",
-            desc,
-            elapsed.as_secs_f64() * 1000.0,
-            tokens_per_sec,
+            "  [Vanilla GEMM] {:<28} {:>9.3}ms  ({:.0} tok/s)",
+            desc, elapsed.as_secs_f64() * 1000.0,
+            gemm_batch as f64 / elapsed.as_secs_f64(),
         );
     }
-    println!(
-        "  [Vanilla] Weight memory footprint: {:.2} MB (dense FP16)",
-        vanilla_mem_bytes as f64 / (1024.0 * 1024.0)
-    );
 
-    // ----------------------------------------------------------------
-    // Phase 6: Run 2 — Saccade Adaptive C-TARQ Execution
-    // ----------------------------------------------------------------
-    println!("\n=== Phase 6: Run 2 — Saccade C-TARQ Adaptive Execution ===");
-    println!("Executing with fused 4-bit register unpacking + sparse CSR deltas.\n");
-
-    // Saccade memory footprint: packed_base (4 bits/param) + scales + sparse delta overhead
-    let saccade_base_bytes = total_params / 2; // 4 bits per weight
-    let saccade_scale_bytes = saccade_linear.out_features * 2; // f16 per row
-    let saccade_delta_bytes = nnz * (4 + 1) // col_index(u32) + value(u8)
-        + (saccade_linear.out_features + 1) * 4 // row_ptrs(u32)
-        + 2; // scale(f16)
-    let saccade_total_bytes = saccade_base_bytes + saccade_scale_bytes + saccade_delta_bytes;
-
-    for &(desc, ref input, _, ref routes) in &test_inputs {
-        // Warm-up pass
-        let _ = input.apply_op1_no_bwd(saccade_linear)?;
-
+    // Saccade GEMM
+    for &(desc, ref input, ref routes) in &gemm_tests {
+        let _ = input.apply_op1_no_bwd(saccade_linear)?; // warm-up
         let start = std::time::Instant::now();
         let _out = input.apply_op1_no_bwd(saccade_linear)?;
         let elapsed = start.elapsed();
-
-        let tokens_per_sec = test_size as f64 / elapsed.as_secs_f64();
         let bpt = routes.avg_bpt(nnz, total_params);
         println!(
-            "  [Saccade] {:<30} {:>9.3}ms  ({:.0} tok/s)  BPT: {:.2}",
-            desc,
-            elapsed.as_secs_f64() * 1000.0,
-            tokens_per_sec,
-            bpt,
+            "  [Saccade GEMM] {:<28} {:>9.3}ms  ({:.0} tok/s)  BPT: {:.2}",
+            desc, elapsed.as_secs_f64() * 1000.0,
+            gemm_batch as f64 / elapsed.as_secs_f64(), bpt,
         );
     }
-    println!(
-        "  [Saccade] Weight memory footprint: {:.2} MB (4-bit packed + sparse CSR)",
-        saccade_total_bytes as f64 / (1024.0 * 1024.0)
-    );
+
+    // ================================================================
+    // Phase 6: GEMV Benchmark (batch=1, autoregressive decoding)
+    //
+    // This is the scenario Saccade was engineered for. Autoregressive
+    // text generation processes one token at a time, turning the workload
+    // into a matrix-vector product (GEMV). GEMV has low arithmetic
+    // intensity and is dominated by memory-bandwidth — exactly where
+    // Saccade's 4-bit packed weights reduce DRAM traffic.
+    //
+    // We loop `gemv_iters` single-token passes to get stable timing,
+    // simulating a real decode sequence.
+    // ================================================================
+    println!("\n=== Phase 6: GEMV Benchmark (batch=1, {} iterations) ===", gemv_iters);
+    println!("Matrix-vector product — simulates autoregressive decoding.\n");
+
+    let gemv_tests = vec![
+        ("Prose (Low Volatility)", &prose_gemv, &prose_routes_1),
+        ("Logic (Medium Volatility)", &logic_gemv, &logic_routes_1),
+        ("Code  (High Volatility)", &code_gemv, &code_routes_1),
+    ];
+
+    // Vanilla GEMV
+    for &(desc, ref input, _) in &gemv_tests {
+        let input_f16 = input.to_dtype(DType::F16)?;
+        // Warm up the pipeline
+        for _ in 0..5 { let _ = input_f16.matmul(&weight_t)?; }
+
+        let start = std::time::Instant::now();
+        for _ in 0..gemv_iters {
+            let _out = input_f16.matmul(&weight_t)?;
+        }
+        let elapsed = start.elapsed();
+        let per_token_us = elapsed.as_micros() as f64 / gemv_iters as f64;
+        println!(
+            "  [Vanilla GEMV] {:<28} {:>9.1}us/tok  ({:.0} tok/s)",
+            desc, per_token_us,
+            1_000_000.0 / per_token_us,
+        );
+    }
+
+    // Saccade GEMV
+    for &(desc, ref input, ref routes) in &gemv_tests {
+        // Warm up
+        for _ in 0..5 { let _ = input.apply_op1_no_bwd(saccade_linear)?; }
+
+        let start = std::time::Instant::now();
+        for _ in 0..gemv_iters {
+            let _out = input.apply_op1_no_bwd(saccade_linear)?;
+        }
+        let elapsed = start.elapsed();
+        let per_token_us = elapsed.as_micros() as f64 / gemv_iters as f64;
+        let bpt = routes.avg_bpt(nnz, total_params);
+        println!(
+            "  [Saccade GEMV] {:<28} {:>9.1}us/tok  ({:.0} tok/s)  BPT: {:.2}",
+            desc, per_token_us,
+            1_000_000.0 / per_token_us, bpt,
+        );
+    }
 
     // ----------------------------------------------------------------
     // Phase 7: Comparative Summary
@@ -317,19 +364,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Phase 7: Comparative Summary ===");
     let compression_ratio = vanilla_mem_bytes as f64 / saccade_total_bytes as f64;
     println!(
-        "  Memory reduction: {:.2} MB -> {:.2} MB ({:.1}x compression)",
+        "  Memory: {:.2} MB (FP16) -> {:.2} MB (Saccade) = {:.1}x compression",
         vanilla_mem_bytes as f64 / (1024.0 * 1024.0),
         saccade_total_bytes as f64 / (1024.0 * 1024.0),
         compression_ratio,
     );
-    println!(
-        "  Vanilla BPT: 16.00 (dense FP16) across all profiles"
-    );
+    println!("  Vanilla BPT: 16.00 (dense FP16, all profiles)");
+    println!("  Saccade BPT [Prose]: {:.2} (base-only)", prose_routes_1.avg_bpt(nnz, total_params));
+    println!("  Saccade BPT [Logic]: {:.2} (Q8 delta)", logic_routes_1.avg_bpt(nnz, total_params));
+    println!("  Saccade BPT [Code]:  {:.2} (FP16 fallback)", code_routes_1.avg_bpt(nnz, total_params));
 
-    for &(desc, _, _, ref routes) in &test_inputs {
-        let bpt = routes.avg_bpt(nnz, total_params);
-        println!("  Saccade BPT [{}]: {:.2}", desc, bpt);
-    }
+    println!(
+        "\n  NOTE: This benchmark targets a single layer ({:.2} MB dense). On CPUs",
+        vanilla_mem_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!("  with large L3 caches, the weights may remain cache-resident, hiding");
+    println!("  DRAM bandwidth costs. Saccade's compression advantage grows when");
+    println!("  full-model inference forces weight streaming from main memory.");
 
     println!("\nDone.");
     Ok(())

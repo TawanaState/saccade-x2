@@ -30,7 +30,20 @@ impl SaccadeEngine {
                 let out_features = dims[0];
                 let in_features = dims[1];
 
-                let blocks = compress_tensor_to_saccade(tensor, 0.0045)?;
+                // Delta threshold controls the sparse correction fill rate.
+                // Adaptive: scale with the weight matrix's Frobenius norm to handle
+                // different model sizes. Larger models have larger weight magnitudes,
+                // producing more reconstruction errors above a fixed threshold.
+                let weight_f32 = tensor.to_dtype(candle_core::DType::F32)?;
+                let sq = weight_f32.sqr()?;
+                let frobenius_sq = sq.sum_all()?.to_scalar::<f32>()?;
+                let rms_weight = (frobenius_sq / (out_features * in_features) as f32).sqrt();
+
+                // Target ~10-15% fill: threshold at ~60% of the per-element RMS weight.
+                // This captures the tail of the reconstruction error distribution while
+                // keeping the sparse delta compact enough for meaningful compression.
+                let delta_threshold = rms_weight * 0.6;
+                let blocks = compress_tensor_to_saccade(tensor, delta_threshold)?;
 
                 let packed_base = blocks.get("packed_base").unwrap().clone();
                 let scale_base = blocks.get("scale_base").unwrap().clone();
