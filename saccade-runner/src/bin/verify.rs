@@ -1,5 +1,6 @@
 use candle_core::{Device, Tensor};
 use saccade_core::{SaccadeConfig, SaccadeLinearOp};
+use saccade_core::config::SparseDeltaMatrix;
 use std::collections::HashMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,19 +20,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scale_base_data: Vec<half::f16> = vec![half::f16::from_f32(0.5); out_features];
     let scale_base = Tensor::from_vec(scale_base_data, (out_features,), &device)?;
 
-    // Generate mock sparse delta q8 (we use dense here per the architecture simplification)
-    let delta_elements = out_features * in_features;
-    let mut delta_q8_data: Vec<half::f16> = vec![half::f16::from_f32(0.0); delta_elements];
-    // Add some non-zero sparse corrections
-    delta_q8_data[0] = half::f16::from_f32(1.5);
-    delta_q8_data[15] = half::f16::from_f32(-0.5);
-    let delta_q8_blocks = Tensor::from_vec(delta_q8_data, (out_features, in_features), &device)?;
+    // Generate mock sparse CSR delta q8
+    let mut delta_row_ptrs: Vec<u32> = vec![0; out_features + 1];
+    let mut delta_col_indices: Vec<u32> = vec![];
+    let mut delta_values: Vec<u8> = vec![];
+
+    // Add non-zero sparse corrections (e.g. at row 0 col 0, row 0 col 15)
+    delta_row_ptrs[1] = 2;
+    for i in 2..=out_features {
+        delta_row_ptrs[i] = 2; // the rest of rows are empty
+    }
+    delta_col_indices.push(0);
+    delta_values.push(10i8 as u8);
+
+    delta_col_indices.push(15);
+    delta_values.push(-5i8 as u8);
+
+    let delta_row_ptrs_tensor = Tensor::from_vec(delta_row_ptrs, (out_features + 1,), &device)?;
+    let delta_col_indices_tensor = Tensor::from_vec(delta_col_indices, (2,), &device)?;
+    let delta_values_tensor = Tensor::from_vec(delta_values, (2,), &device)?;
+    let delta_scale_tensor = Tensor::from_vec(vec![half::f16::from_f32(0.15)], (1,), &device)?;
 
     // Serialize to safetensors to ensure compliance with step 3
     let mut tensors = HashMap::new();
     tensors.insert("packed_base".to_string(), packed_base);
     tensors.insert("scale_base".to_string(), scale_base);
-    tensors.insert("delta_q8".to_string(), delta_q8_blocks);
+    tensors.insert("delta_row_ptrs".to_string(), delta_row_ptrs_tensor);
+    tensors.insert("delta_col_indices".to_string(), delta_col_indices_tensor);
+    tensors.insert("delta_values".to_string(), delta_values_tensor);
+    tensors.insert("delta_scale".to_string(), delta_scale_tensor);
 
     let model_path = "mock_model.safetensors";
     candle_core::safetensors::save(&tensors, model_path)?;
@@ -40,7 +57,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loaded_tensors = candle_core::safetensors::load(model_path, &device)?;
     let loaded_packed_base = loaded_tensors.get("packed_base").unwrap().clone();
     let loaded_scale_base = loaded_tensors.get("scale_base").unwrap().clone();
-    let loaded_delta_q8 = loaded_tensors.get("delta_q8").unwrap().clone();
+
+    let sparse_delta_q8 = Some(SparseDeltaMatrix {
+        row_ptrs: loaded_tensors.get("delta_row_ptrs").unwrap().clone(),
+        col_indices: loaded_tensors.get("delta_col_indices").unwrap().clone(),
+        values: loaded_tensors.get("delta_values").unwrap().clone(),
+        scale: loaded_tensors.get("delta_scale").unwrap().clone(),
+    });
 
     // Initialize the Saccade custom operator
     let config = SaccadeConfig {
@@ -53,9 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let saccade_linear = SaccadeLinearOp {
         packed_base: loaded_packed_base,
         scale_base: loaded_scale_base,
-        delta_q8_blocks: loaded_delta_q8,
-        delta_q8_scales: None,
-        delta_fp16_blocks: None,
+        sparse_delta_q8,
+        sparse_delta_fp16: None,
         config,
         out_features,
         in_features,

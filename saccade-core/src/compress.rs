@@ -25,7 +25,16 @@ pub fn compress_tensor_to_saccade(
 
     let mut packed_base_data = vec![0u32; out_features * (in_features / 8)];
     let mut scale_base_data = vec![0.0f32; out_features];
-    let mut delta_q8_data = vec![0.0f32; out_features * in_features];
+
+    // Sparse CSR delta data
+    let mut delta_row_ptrs = Vec::with_capacity(out_features + 1);
+    let mut delta_col_indices = Vec::new();
+    let mut delta_values = Vec::new();
+
+    // First, we need to collect the raw errors to find the global maximum error
+    // for quantization.
+    let mut max_error_abs = 0.0f32;
+    let mut error_matrix = vec![vec![0.0f32; in_features]; out_features];
 
     for row in 0..out_features {
         // Find max absolute value in the row to determine symmetric scale
@@ -62,14 +71,38 @@ pub fn compress_tensor_to_saccade(
                 let dequantized = (q_val as f32) * scale;
                 let error = val - dequantized;
 
-                // If error magnitude exceeds threshold, store it in the delta matrix
+                // If error magnitude exceeds threshold, store it
                 if error.abs() > delta_threshold {
-                    delta_q8_data[row * in_features + col] = error;
+                    error_matrix[row][col] = error;
+                    if error.abs() > max_error_abs {
+                        max_error_abs = error.abs();
+                    }
                 }
             }
             packed_base_data[row * (in_features / 8) + k_packed] = packed_u32;
         }
     }
+
+    // Now construct the sparse structures
+    let delta_scale = if max_error_abs > 0.0 { max_error_abs / 127.0 } else { 1.0 };
+
+    let mut current_ptr = 0u32;
+    for row in 0..out_features {
+        delta_row_ptrs.push(current_ptr);
+        for col in 0..in_features {
+            let err = error_matrix[row][col];
+            if err != 0.0 {
+                delta_col_indices.push(col as u32);
+                let q_err = (err / delta_scale).round() as i32;
+                let q_err_i8 = q_err.max(-128).min(127) as i8;
+                // store as u8 for candle tensor (no i8 support in candle commonly),
+                // we will interpret it as i8.
+                delta_values.push(q_err_i8 as u8);
+                current_ptr += 1;
+            }
+        }
+    }
+    delta_row_ptrs.push(current_ptr);
 
     let packed_base = Tensor::from_vec(packed_base_data, (out_features, in_features / 8), device)?;
 
@@ -77,14 +110,21 @@ pub fn compress_tensor_to_saccade(
     let scale_f16 = scale_base_data.iter().map(|&v| half::f16::from_f32(v)).collect::<Vec<_>>();
     let scale_base = Tensor::from_vec(scale_f16, (out_features,), device)?;
 
-    // Delta must be F16 for SaccadeLinearOp
-    let delta_f16 = delta_q8_data.iter().map(|&v| half::f16::from_f32(v)).collect::<Vec<_>>();
-    let delta_q8_blocks = Tensor::from_vec(delta_f16, (out_features, in_features), device)?;
-
     let mut compressed_state = HashMap::new();
     compressed_state.insert("packed_base".to_string(), packed_base);
     compressed_state.insert("scale_base".to_string(), scale_base);
-    compressed_state.insert("delta_q8".to_string(), delta_q8_blocks);
+
+    if current_ptr > 0 {
+        let row_ptrs_tensor = Tensor::from_vec(delta_row_ptrs, (out_features + 1,), device)?;
+        let col_indices_tensor = Tensor::from_vec(delta_col_indices, (current_ptr as usize,), device)?;
+        let values_tensor = Tensor::from_vec(delta_values, (current_ptr as usize,), device)?;
+        let scale_tensor = Tensor::from_vec(vec![half::f16::from_f32(delta_scale)], (1,), device)?;
+
+        compressed_state.insert("delta_row_ptrs".to_string(), row_ptrs_tensor);
+        compressed_state.insert("delta_col_indices".to_string(), col_indices_tensor);
+        compressed_state.insert("delta_values".to_string(), values_tensor);
+        compressed_state.insert("delta_scale".to_string(), scale_tensor);
+    }
 
     Ok(compressed_state)
 }

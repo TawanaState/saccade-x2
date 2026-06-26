@@ -1095,7 +1095,6 @@ dependencies = [
  "half",
  "hf-hub",
  "saccade-core",
- "safetensors",
 ]
 
 [[package]]

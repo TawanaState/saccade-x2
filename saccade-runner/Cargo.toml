@@ -7,7 +7,14 @@ edition = "2021"
 candle-core = "0.4.1"
 candle-nn = "0.4.1"
 candle-transformers = "0.4.1"
-half = "2.3.1"
-hf-hub = "0.3.2"
 saccade-core = { path = "../saccade-core" }
-safetensors = "0.4.5"
+hf-hub = "0.3.2"
+half = "2.3.1"
+
+[[bin]]
+name = "qwen_example"
+path = "src/bin/qwen_example.rs"
+
+[[bin]]
+name = "verify"
+path = "src/bin/verify.rs"
