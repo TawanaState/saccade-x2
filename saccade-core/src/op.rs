@@ -44,21 +44,82 @@ impl CustomOp1 for SaccadeLinearOp {
             _ => return Err(candle_core::Error::Msg("Scale block storage corruption".into())),
         };
 
-        // Extract deltas if available
-        let mut w_delta_8: Option<&[half::f16]> = None;
-        let d8_store = self.delta_q8_blocks.storage_and_layout().0;
-        if let candle_core::Storage::Cpu(cpu_store) = &*d8_store {
-            if let Ok(slice) = cpu_store.as_slice::<half::f16>() {
-                w_delta_8 = Some(slice);
+        // We must hold the `Storage` locks outside the loop so the slices live long enough.
+        struct CsrSlices<'a> {
+            r: &'a [u32],
+            c: &'a [u32],
+            v: &'a [u8],
+            s: f32,
+        }
+
+        let mut d8_r_store_opt = None;
+        let mut d8_c_store_opt = None;
+        let mut d8_v_store_opt = None;
+        let mut d8_s_store_opt = None;
+
+        let mut csr_q8 = None;
+        if let Some(sp) = &self.sparse_delta_q8 {
+            d8_r_store_opt = Some(sp.row_ptrs.storage_and_layout().0);
+            d8_c_store_opt = Some(sp.col_indices.storage_and_layout().0);
+            d8_v_store_opt = Some(sp.values.storage_and_layout().0);
+            d8_s_store_opt = Some(sp.scale.storage_and_layout().0);
+
+            if let (
+                Some(r_store),
+                Some(c_store),
+                Some(v_store),
+                Some(s_store)
+            ) = (&d8_r_store_opt, &d8_c_store_opt, &d8_v_store_opt, &d8_s_store_opt) {
+                if let (
+                    candle_core::Storage::Cpu(r_cpu),
+                    candle_core::Storage::Cpu(c_cpu),
+                    candle_core::Storage::Cpu(v_cpu),
+                    candle_core::Storage::Cpu(s_cpu)
+                ) = (&**r_store, &**c_store, &**v_store, &**s_store) {
+                    if let (Ok(r), Ok(c), Ok(v), Ok(s)) = (
+                        r_cpu.as_slice::<u32>(),
+                        c_cpu.as_slice::<u32>(),
+                        v_cpu.as_slice::<u8>(),
+                        s_cpu.as_slice::<half::f16>()
+                    ) {
+                        csr_q8 = Some(CsrSlices { r, c, v, s: s[0].to_f32() });
+                    }
+                }
             }
         }
 
-        let mut w_delta_16: Option<&[half::f16]> = None;
-        let d16_store_opt = self.delta_fp16_blocks.as_ref().map(|t| t.storage_and_layout().0);
-        if let Some(d16_store) = &d16_store_opt {
-            if let candle_core::Storage::Cpu(cpu_store) = &**d16_store {
-                if let Ok(slice) = cpu_store.as_slice::<half::f16>() {
-                    w_delta_16 = Some(slice);
+        let mut d16_r_store_opt = None;
+        let mut d16_c_store_opt = None;
+        let mut d16_v_store_opt = None;
+        let mut d16_s_store_opt = None;
+
+        let mut csr_fp16 = None;
+        if let Some(sp) = &self.sparse_delta_fp16 {
+            d16_r_store_opt = Some(sp.row_ptrs.storage_and_layout().0);
+            d16_c_store_opt = Some(sp.col_indices.storage_and_layout().0);
+            d16_v_store_opt = Some(sp.values.storage_and_layout().0);
+            d16_s_store_opt = Some(sp.scale.storage_and_layout().0);
+
+            if let (
+                Some(r_store),
+                Some(c_store),
+                Some(v_store),
+                Some(s_store)
+            ) = (&d16_r_store_opt, &d16_c_store_opt, &d16_v_store_opt, &d16_s_store_opt) {
+                if let (
+                    candle_core::Storage::Cpu(r_cpu),
+                    candle_core::Storage::Cpu(c_cpu),
+                    candle_core::Storage::Cpu(v_cpu),
+                    candle_core::Storage::Cpu(s_cpu)
+                ) = (&**r_store, &**c_store, &**v_store, &**s_store) {
+                    if let (Ok(r), Ok(c), Ok(v), Ok(s)) = (
+                        r_cpu.as_slice::<u32>(),
+                        c_cpu.as_slice::<u32>(),
+                        v_cpu.as_slice::<u8>(),
+                        s_cpu.as_slice::<half::f16>()
+                    ) {
+                        csr_fp16 = Some(CsrSlices { r, c, v, s: s[0].to_f32() });
+                    }
                 }
             }
         }
@@ -83,7 +144,7 @@ impl CustomOp1 for SaccadeLinearOp {
                 let row_weight_offset = row * (self.in_features / 8);
                 let current_scale = base_scales[row].to_f32();
 
-                // Process packed u32 boundaries using micro-vector blocks
+                // Process packed u32 boundaries using micro-vector blocks for base
                 for k_packed in 0..(self.in_features / 8) {
                     let packed_val = packed_weights[row_weight_offset + k_packed];
                     let k_unpacked_base = k_packed * 8;
@@ -94,24 +155,35 @@ impl CustomOp1 for SaccadeLinearOp {
                         // Center values from [0, 15] back to the signed range [-8, +7]
                         let base_weight = (raw_nibble as f32 - 8.0) * current_scale;
 
-                        let mut total_weight = base_weight;
-
-                        // Add sparse delta if needed
-                        let element_idx = row * self.in_features + k_unpacked_base + idx;
-
-                        if use_delta_q8 {
-                            if let Some(delta_8) = w_delta_8 {
-                                total_weight += delta_8[element_idx].to_f32();
-                            }
-                        } else if use_delta_fp16 {
-                            if let Some(delta_16) = w_delta_16 {
-                                total_weight += delta_16[element_idx].to_f32();
-                            }
-                        }
-
-                        dot_accumulator += current_token_slice[k_unpacked_base + idx].to_f32() * total_weight;
+                        dot_accumulator += current_token_slice[k_unpacked_base + idx].to_f32() * base_weight;
                     }
                 }
+
+                // Add sparse delta updates if thresholds match using CSR traversal
+                if use_delta_q8 {
+                    if let Some(ref csr) = csr_q8 {
+                        let row_start = csr.r[row] as usize;
+                        let row_end = csr.r[row + 1] as usize;
+                        for i in row_start..row_end {
+                            let col = csr.c[i] as usize;
+                            let val_i8 = csr.v[i] as i8; // Reinterpret back to signed 8-bit
+                            let weight_update = (val_i8 as f32) * csr.s;
+                            dot_accumulator += current_token_slice[col].to_f32() * weight_update;
+                        }
+                    }
+                } else if use_delta_fp16 {
+                    if let Some(ref csr) = csr_fp16 {
+                        let row_start = csr.r[row] as usize;
+                        let row_end = csr.r[row + 1] as usize;
+                        for i in row_start..row_end {
+                            let col = csr.c[i] as usize;
+                            let val_i8 = csr.v[i] as i8; // Assumes fp16 uses same quant block logic for now
+                            let weight_update = (val_i8 as f32) * csr.s;
+                            dot_accumulator += current_token_slice[col].to_f32() * weight_update;
+                        }
+                    }
+                }
+
                 *out_val = half::f16::from_f32(dot_accumulator);
             });
         }
