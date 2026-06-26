@@ -166,16 +166,43 @@ Memory: 26.25 MB (FP16) → 6.83 MB (Saccade) = 3.8x compression
 
 ---
 
-## Running the End-to-End Example
+## Running the Production Toolkit
 
-The benchmark harness downloads Qwen2-1.5B-Instruct, runs offline calibration, compresses the target layer, and executes both vanilla and Saccade pipelines in GEMM and GEMV configurations.
+### Model Compilation
 
-**Execute (release mode with native SIMD):**
+Compress a HuggingFace model into Saccade format, targeting all MLP layers across the full transformer:
+
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-compile -- \
+  --model-id Qwen/Qwen2.5-0.5B-Instruct \
+  --calib-file calibration.txt \
+  --output-path saccade_qwen.safetensors \
+  --target-fill 0.15
 ```
 
-For the minimal validation harness:
+The `--calib-file` accepts any plain-text file. The compiler tokenizes it, runs hybrid calibration through the first 4 model layers, extracts routing thresholds, and compresses all 72 MLP projections (24 layers × gate/up/down).
+
+### Streaming Inference
+
+Run inference with streaming token output and performance telemetry:
+
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin verify
+# Saccade compressed mode
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-run -- \
+  --checkpoint saccade_qwen.safetensors \
+  --prompt "Explain the benefits of model compression" \
+  --max-tokens 100
+
+# Vanilla HF baseline mode
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-run -- \
+  --model-id Qwen/Qwen2.5-0.5B-Instruct \
+  --prompt "Explain the benefits of model compression" \
+  --max-tokens 100
+```
+
+### Micro-benchmarks
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example  # GEMM/GEMV comparative
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin verify        # Minimal validation
 ```

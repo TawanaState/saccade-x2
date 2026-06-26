@@ -129,6 +129,52 @@ pub fn compress_tensor_to_saccade(
     Ok(compressed_state)
 }
 
+/// Computes the delta threshold that produces a specific fill rate for a given weight tensor.
+/// Performs a fast 4-bit quantization pass, collects all reconstruction errors, and returns
+/// the error magnitude at the (1 - target_fill_pct) percentile. For example, target_fill_pct=0.15
+/// returns the threshold below which 85% of errors fall, ensuring ~15% of elements get delta
+/// corrections — producing BPT in the 5.11-5.29 range.
+pub fn compute_percentile_threshold(
+    base_tensor: &Tensor,
+    target_fill_pct: f32,
+) -> candle_core::Result<f32> {
+    let base_f32 = base_tensor.to_dtype(DType::F32)?.to_device(&Device::Cpu)?;
+    let base_data = base_f32.to_vec2::<f32>()?;
+    let out_features = base_data.len();
+    let in_features = base_data[0].len();
+
+    let mut all_errors: Vec<f32> = Vec::with_capacity(out_features * in_features);
+
+    for row in 0..out_features {
+        let mut max_abs = 0.0f32;
+        for col in 0..in_features {
+            let val = base_data[row][col].abs();
+            if val > max_abs { max_abs = val; }
+        }
+        let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
+
+        for col in 0..in_features {
+            let val = base_data[row][col];
+            let q_val = (val / scale).round().max(-8.0).min(7.0) as i32;
+            let dequantized = (q_val as f32) * scale;
+            let error = (val - dequantized).abs();
+            if error > 1e-10 {
+                all_errors.push(error);
+            }
+        }
+    }
+
+    if all_errors.is_empty() {
+        return Ok(0.001);
+    }
+
+    all_errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let percentile_idx = ((1.0 - target_fill_pct) * all_errors.len() as f32) as usize;
+    let idx = percentile_idx.min(all_errors.len().saturating_sub(1));
+    Ok(all_errors[idx])
+}
+
 /// Iterates through an entire tensor map (e.g., from a safetensors file) and compresses
 /// specific target linear projections to Saccade format. Unmatched layers are kept untouched.
 pub fn compress_model_layers(

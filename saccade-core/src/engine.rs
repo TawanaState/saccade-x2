@@ -7,7 +7,12 @@ pub struct SaccadeEngine;
 
 impl SaccadeEngine {
     fn extract_scalar_f32(t: &Tensor) -> candle_core::Result<f32> {
-        // Handle both rank-0 scalars and rank-1 (1,) tensors from safetensors metadata.
+        Self::extract_scalar_f32_pub(Some(t))
+    }
+
+    /// Extract a scalar f32 from an optional tensor, handling both rank-0 and rank-1 shapes.
+    pub fn extract_scalar_f32_pub(t: Option<&Tensor>) -> candle_core::Result<f32> {
+        let t = t.ok_or_else(|| candle_core::Error::Msg("Missing threshold tensor".into()))?;
         let flat = t.flatten_all()?.to_dtype(candle_core::DType::F32)?;
         let vals = flat.to_vec1::<f32>()?;
         vals.first().copied().ok_or_else(|| candle_core::Error::Msg("Empty threshold tensor".into()))
@@ -30,19 +35,10 @@ impl SaccadeEngine {
                 let out_features = dims[0];
                 let in_features = dims[1];
 
-                // Delta threshold controls the sparse correction fill rate.
-                // Adaptive: scale with the weight matrix's Frobenius norm to handle
-                // different model sizes. Larger models have larger weight magnitudes,
-                // producing more reconstruction errors above a fixed threshold.
-                let weight_f32 = tensor.to_dtype(candle_core::DType::F32)?;
-                let sq = weight_f32.sqr()?;
-                let frobenius_sq = sq.sum_all()?.to_scalar::<f32>()?;
-                let rms_weight = (frobenius_sq / (out_features * in_features) as f32).sqrt();
-
-                // Target ~10-15% fill: threshold at ~60% of the per-element RMS weight.
-                // This captures the tail of the reconstruction error distribution while
-                // keeping the sparse delta compact enough for meaningful compression.
-                let delta_threshold = rms_weight * 0.6;
+                // Percentile-based threshold: compute the actual error distribution for this
+                // layer and select the cutoff that produces ~15% fill rate. This adapts
+                // automatically to different weight magnitudes across model sizes and layers.
+                let delta_threshold = crate::compress::compute_percentile_threshold(tensor, 0.15)?;
                 let blocks = compress_tensor_to_saccade(tensor, delta_threshold)?;
 
                 let packed_base = blocks.get("packed_base").unwrap().clone();
