@@ -18,8 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Phase 2: Real Model Compression via SaccadeEngine ===");
     // Configure the Saccade runtime engine heuristics
+    // By using a slightly lower threshold we can force some sparse updates
+    // for testing.
     let config = SaccadeConfig {
-        t4: 0.1, // A very low threshold to trigger deltas for our test token
+        t4: 0.05, // A very low threshold to trigger deltas for our test token
         t8: 999.0, // FP16 threshold not used
         block_size: 16,
         heuristic: saccade_core::variance_heuristic,
