@@ -1,6 +1,4 @@
 use candle_core::Tensor;
-use crate::heuristics::variance_heuristic;
-
 /// Profiling framework to extract scale-invariant runtime routing thresholds
 /// from offline sample sequences, avoiding manual heuristic overrides.
 pub struct ProfileRunner;

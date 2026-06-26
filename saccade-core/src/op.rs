@@ -1,5 +1,4 @@
-use candle_core::{CustomOp1, CpuStorage, Layout, Result, Shape, Tensor};
-use rayon::prelude::*;
+use candle_core::{CustomOp1, CpuStorage, Layout, Result, Shape};
 use crate::config::SaccadeLinearOp;
 
 impl CustomOp1 for SaccadeLinearOp {
@@ -7,19 +6,14 @@ impl CustomOp1 for SaccadeLinearOp {
         "fused_c_tarq_saccade_linear"
     }
 
-    /// Pure, side-effect-free vector mathematical execution block compiled for the CPU host engine.
-    /// Vectorized operations are optimized to match system registers, avoiding PyTorch-style graph splits.
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        // Evaluate the multi-dimensional feature shape after executing the custom activation transformation
         let input_shape = layout.shape();
         let mut dims = input_shape.dims().to_vec();
-        // Overwrite the final feature axis to match the linear projection layer configuration
         if let Some(last_dim) = dims.last_mut() {
             *last_dim = self.out_features;
         }
         let out_shape = Shape::from(dims.as_slice());
 
-        // Extract raw pointer references from the incoming linear activation tensor
         let raw_activations = storage.as_slice::<half::f16>()?;
         let shape = layout.shape();
         let dims = shape.dims();
@@ -27,165 +21,133 @@ impl CustomOp1 for SaccadeLinearOp {
         let batch_tokens = dims[0..dims.len() - 1].iter().product::<usize>();
         let hidden_dim = dims[dims.len() - 1];
 
-        // Allocate the destination output array matching the target projection metrics
         let output_elements = batch_tokens * self.out_features;
         let mut output_buffer = vec![half::f16::from_f32(0.0); output_elements];
 
-        // Access raw binary data arrays from the registered buffers
-        let (base_data, _base_layout) = self.packed_base.storage_and_layout();
+        let (base_data, _) = self.packed_base.storage_and_layout();
         let packed_weights = match &*base_data {
             candle_core::Storage::Cpu(cpu_store) => cpu_store.as_slice::<u32>()?,
-            _ => return Err(candle_core::Error::Msg("Hardware substrate target mismatch: Expected CPU registry".into())),
+            _ => return Err(candle_core::Error::Msg("Expected CPU storage for packed_base".into())),
         };
 
         let (scale_data, _) = self.scale_base.storage_and_layout();
         let base_scales = match &*scale_data {
             candle_core::Storage::Cpu(cpu_store) => cpu_store.as_slice::<half::f16>()?,
-            _ => return Err(candle_core::Error::Msg("Scale block storage corruption".into())),
+            _ => return Err(candle_core::Error::Msg("Expected CPU storage for scale_base".into())),
         };
 
-        // We must hold the `Storage` locks outside the loop so the slices live long enough.
-        struct CsrSlices<'a> {
-            r: &'a [u32],
-            c: &'a [u32],
-            v: &'a [u8],
+        struct OwnedCsr {
+            r: Vec<u32>,
+            c: Vec<u32>,
+            v: Vec<u8>,
             s: f32,
         }
 
-        let mut d8_r_store_opt = None;
-        let mut d8_c_store_opt = None;
-        let mut d8_v_store_opt = None;
-        let mut d8_s_store_opt = None;
+        let csr_q8: Option<OwnedCsr> = if let Some(sp) = &self.sparse_delta_q8 {
+            let r_guard = sp.row_ptrs.storage_and_layout().0;
+            let c_guard = sp.col_indices.storage_and_layout().0;
+            let v_guard = sp.values.storage_and_layout().0;
+            let s_guard = sp.scale.storage_and_layout().0;
 
-        let mut csr_q8 = None;
-        if let Some(sp) = &self.sparse_delta_q8 {
-            d8_r_store_opt = Some(sp.row_ptrs.storage_and_layout().0);
-            d8_c_store_opt = Some(sp.col_indices.storage_and_layout().0);
-            d8_v_store_opt = Some(sp.values.storage_and_layout().0);
-            d8_s_store_opt = Some(sp.scale.storage_and_layout().0);
-
-            if let (
-                Some(r_store),
-                Some(c_store),
-                Some(v_store),
-                Some(s_store)
-            ) = (&d8_r_store_opt, &d8_c_store_opt, &d8_v_store_opt, &d8_s_store_opt) {
-                if let (
+            match (&*r_guard, &*c_guard, &*v_guard, &*s_guard) {
+                (
                     candle_core::Storage::Cpu(r_cpu),
                     candle_core::Storage::Cpu(c_cpu),
                     candle_core::Storage::Cpu(v_cpu),
-                    candle_core::Storage::Cpu(s_cpu)
-                ) = (&**r_store, &**c_store, &**v_store, &**s_store) {
-                    if let (Ok(r), Ok(c), Ok(v), Ok(s)) = (
-                        r_cpu.as_slice::<u32>(),
-                        c_cpu.as_slice::<u32>(),
-                        v_cpu.as_slice::<u8>(),
-                        s_cpu.as_slice::<half::f16>()
-                    ) {
-                        csr_q8 = Some(CsrSlices { r, c, v, s: s[0].to_f32() });
-                    }
+                    candle_core::Storage::Cpu(s_cpu),
+                ) => {
+                    let r = r_cpu.as_slice::<u32>()?.to_vec();
+                    let c = c_cpu.as_slice::<u32>()?.to_vec();
+                    let v = v_cpu.as_slice::<u8>()?.to_vec();
+                    let s = s_cpu.as_slice::<half::f16>()?[0].to_f32();
+                    Some(OwnedCsr { r, c, v, s })
                 }
+                _ => None,
             }
+        } else {
+            None
+        };
+
+        let mut token_routes: Vec<(bool, bool)> = Vec::with_capacity(batch_tokens);
+        for t in 0..batch_tokens {
+            let act_offset = t * hidden_dim;
+            let slice = &raw_activations[act_offset..act_offset + hidden_dim];
+            let score = (self.config.heuristic)(slice);
+            token_routes.push((
+                score >= self.config.t4 && score < self.config.t8,
+                score >= self.config.t8,
+            ));
         }
 
-        let mut d16_r_store_opt = None;
-        let mut d16_c_store_opt = None;
-        let mut d16_v_store_opt = None;
-        let mut d16_s_store_opt = None;
+        let in_features = self.in_features;
+        let out_features = self.out_features;
+        let packed_per_row = in_features / 8;
 
-        let mut csr_fp16 = None;
-        if let Some(sp) = &self.sparse_delta_fp16 {
-            d16_r_store_opt = Some(sp.row_ptrs.storage_and_layout().0);
-            d16_c_store_opt = Some(sp.col_indices.storage_and_layout().0);
-            d16_v_store_opt = Some(sp.values.storage_and_layout().0);
-            d16_s_store_opt = Some(sp.scale.storage_and_layout().0);
+        // Reusable f32 buffer — converted once per token instead of once per row*column.
+        let mut token_f32 = vec![0.0f32; hidden_dim];
 
-            if let (
-                Some(r_store),
-                Some(c_store),
-                Some(v_store),
-                Some(s_store)
-            ) = (&d16_r_store_opt, &d16_c_store_opt, &d16_v_store_opt, &d16_s_store_opt) {
-                if let (
-                    candle_core::Storage::Cpu(r_cpu),
-                    candle_core::Storage::Cpu(c_cpu),
-                    candle_core::Storage::Cpu(v_cpu),
-                    candle_core::Storage::Cpu(s_cpu)
-                ) = (&**r_store, &**c_store, &**v_store, &**s_store) {
-                    if let (Ok(r), Ok(c), Ok(v), Ok(s)) = (
-                        r_cpu.as_slice::<u32>(),
-                        c_cpu.as_slice::<u32>(),
-                        v_cpu.as_slice::<u8>(),
-                        s_cpu.as_slice::<half::f16>()
-                    ) {
-                        csr_fp16 = Some(CsrSlices { r, c, v, s: s[0].to_f32() });
-                    }
-                }
-            }
-        }
-
-        // Loop over the activation timeline sequentially to prevent parallel allocation traps
         for t in 0..batch_tokens {
             let act_offset = t * hidden_dim;
             let current_token_slice = &raw_activations[act_offset..act_offset + hidden_dim];
+            let (use_delta_q8, use_delta_fp16) = token_routes[t];
 
-            // 1. Compute Complexity Heuristic entirely on-chip inside CPU registers
-            let complexity_score = (self.config.heuristic)(current_token_slice);
-
-            // 2. Evaluate frozen complexity thresholds to establish the dynamic execution path
-            let use_delta_q8 = complexity_score >= self.config.t4 && complexity_score < self.config.t8;
-            let use_delta_fp16 = complexity_score >= self.config.t8;
-
-            // 3. Perform Fused Matrix Multiplication across rows of the projection weights
-            // Parallelize computation across rows using Rayon as instructed
-            let out_slice = &mut output_buffer[t * self.out_features..(t + 1) * self.out_features];
-            out_slice.par_iter_mut().enumerate().for_each(|(row, out_val)| {
-                let mut dot_accumulator = 0.0f32;
-                let row_weight_offset = row * (self.in_features / 8);
-                let current_scale = base_scales[row].to_f32();
-
-                // Process packed u32 boundaries using micro-vector blocks for base
-                for k_packed in 0..(self.in_features / 8) {
-                    let packed_val = packed_weights[row_weight_offset + k_packed];
-                    let k_unpacked_base = k_packed * 8;
-
-                    // Unpack 8 distinct parameters in a single loop using register bitwise operators
-                    for idx in 0..8 {
-                        let raw_nibble = (packed_val >> (idx * 4)) & 0x0F;
-                        // Center values from [0, 15] back to the signed range [-8, +7]
-                        let base_weight = (raw_nibble as f32 - 8.0) * current_scale;
-
-                        dot_accumulator += current_token_slice[k_unpacked_base + idx].to_f32() * base_weight;
-                    }
+            // Upfront f16→f32 conversion: 4,864 ops instead of 4,864 * 896 = 4.3M per token.
+            for i in 0..hidden_dim {
+                unsafe {
+                    *token_f32.get_unchecked_mut(i) = current_token_slice.get_unchecked(i).to_f32();
                 }
-                
-                // Add sparse delta updates if thresholds match using CSR traversal
-                if use_delta_q8 {
-                    if let Some(ref csr) = csr_q8 {
-                        let row_start = csr.r[row] as usize;
-                        let row_end = csr.r[row + 1] as usize;
-                        for i in row_start..row_end {
-                            let col = csr.c[i] as usize;
-                            let val_i8 = csr.v[i] as i8; // Reinterpret back to signed 8-bit
-                            let weight_update = (val_i8 as f32) * csr.s;
-                            dot_accumulator += current_token_slice[col].to_f32() * weight_update;
+            }
+
+            let out_slice = &mut output_buffer[t * out_features..(t + 1) * out_features];
+
+            for row in 0..out_features {
+                let mut acc = 0.0f32;
+                let row_weight_offset = row * packed_per_row;
+
+                unsafe {
+                    for k_packed in 0..packed_per_row {
+                        let p = *packed_weights.get_unchecked(row_weight_offset + k_packed);
+                        let base = k_packed * 8;
+
+                        let n0 = (p & 0x0F) as f32 - 8.0;
+                        let n1 = ((p >> 4) & 0x0F) as f32 - 8.0;
+                        let n2 = ((p >> 8) & 0x0F) as f32 - 8.0;
+                        let n3 = ((p >> 12) & 0x0F) as f32 - 8.0;
+                        let n4 = ((p >> 16) & 0x0F) as f32 - 8.0;
+                        let n5 = ((p >> 20) & 0x0F) as f32 - 8.0;
+                        let n6 = ((p >> 24) & 0x0F) as f32 - 8.0;
+                        let n7 = (p >> 28) as f32 - 8.0;
+
+                        acc += *token_f32.get_unchecked(base) * n0;
+                        acc += *token_f32.get_unchecked(base + 1) * n1;
+                        acc += *token_f32.get_unchecked(base + 2) * n2;
+                        acc += *token_f32.get_unchecked(base + 3) * n3;
+                        acc += *token_f32.get_unchecked(base + 4) * n4;
+                        acc += *token_f32.get_unchecked(base + 5) * n5;
+                        acc += *token_f32.get_unchecked(base + 6) * n6;
+                        acc += *token_f32.get_unchecked(base + 7) * n7;
+                    }
+
+                    // Row scale applied once instead of per-lane (4,864 muls → 1).
+                    let scale = base_scales.get_unchecked(row).to_f32();
+                    acc *= scale;
+
+                    if use_delta_q8 || use_delta_fp16 {
+                        if let Some(ref csr) = csr_q8 {
+                            let row_start = *csr.r.get_unchecked(row) as usize;
+                            let row_end = *csr.r.get_unchecked(row + 1) as usize;
+                            for i in row_start..row_end {
+                                let col = *csr.c.get_unchecked(i) as usize;
+                                let val_i8 = *csr.v.get_unchecked(i) as i8;
+                                let weight_update = (val_i8 as f32) * csr.s;
+                                acc += *token_f32.get_unchecked(col) * weight_update;
+                            }
                         }
                     }
-                } else if use_delta_fp16 {
-                    if let Some(ref csr) = csr_fp16 {
-                        let row_start = csr.r[row] as usize;
-                        let row_end = csr.r[row + 1] as usize;
-                        for i in row_start..row_end {
-                            let col = csr.c[i] as usize;
-                            let val_i8 = csr.v[i] as i8; // Assumes fp16 uses same quant block logic for now
-                            let weight_update = (val_i8 as f32) * csr.s;
-                            dot_accumulator += current_token_slice[col].to_f32() * weight_update;
-                        }
-                    }
-                }
 
-                *out_val = half::f16::from_f32(dot_accumulator);
-            });
+                    *out_slice.get_unchecked_mut(row) = half::f16::from_f32(acc);
+                }
+            }
         }
 
         Ok((CpuStorage::F16(output_buffer), out_shape))

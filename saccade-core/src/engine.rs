@@ -6,8 +6,13 @@ use crate::compress::compress_tensor_to_saccade;
 pub struct SaccadeEngine;
 
 impl SaccadeEngine {
-    /// Compiles a model's linear projections dynamically, intercepting requested targets, 
-    /// compressing them on the fly, and substituting the Saccade custom operator.
+    fn extract_scalar_f32(t: &Tensor) -> candle_core::Result<f32> {
+        // Handle both rank-0 scalars and rank-1 (1,) tensors from safetensors metadata.
+        let flat = t.flatten_all()?.to_dtype(candle_core::DType::F32)?;
+        let vals = flat.to_vec1::<f32>()?;
+        vals.first().copied().ok_or_else(|| candle_core::Error::Msg("Empty threshold tensor".into()))
+    }
+
     pub fn compile_model_topology<'a>(
         tensors: &HashMap<String, Tensor>,
         target_substrings: &[&str],
@@ -25,9 +30,7 @@ impl SaccadeEngine {
                 let out_features = dims[0];
                 let in_features = dims[1];
 
-                // Currently we run single delta_threshold. For automated intercept
-                // we assume a fixed threshold matching V3 specs. We will default to 0.05.
-                let blocks = compress_tensor_to_saccade(tensor, 0.05)?;
+                let blocks = compress_tensor_to_saccade(tensor, 0.0045)?;
 
                 let packed_base = blocks.get("packed_base").unwrap().clone();
                 let scale_base = blocks.get("scale_base").unwrap().clone();
@@ -51,13 +54,13 @@ impl SaccadeEngine {
                 let t8_key = format!("{}.saccade_t8", base_name);
 
                 if let Some(t) = tensors.get(&t4_key) {
-                    if let Ok(val) = t.to_scalar::<f32>() {
-                        layer_config.t4 = val;
+                    if let Ok(v) = Self::extract_scalar_f32(t) {
+                        layer_config.t4 = v;
                     }
                 }
                 if let Some(t) = tensors.get(&t8_key) {
-                    if let Ok(val) = t.to_scalar::<f32>() {
-                        layer_config.t8 = val;
+                    if let Ok(v) = Self::extract_scalar_f32(t) {
+                        layer_config.t8 = v;
                     }
                 }
 

@@ -114,36 +114,61 @@ The returned tensor naturally merges with the next network graph layer, allowing
 
 ## 5. Benchmarking and Footprint Optimization
 
-Using Saccade on native hardware provides massive benefits across the memory hierarchy without mathematically destructive quantization techniques since we retain native dynamic paths.
+The benchmarking harness performs a double-blind comparative analysis between vanilla dense FP16 execution and Saccade's adaptive C-TARQ pipeline. Both runs operate on identical inputs derived from the same Qwen2-0.5B-Instruct weight matrix.
 
-Below are the exact execution footprints captured during our integration mapping of `Qwen2-0.5B-Instruct` targeting `model.layers.0.mlp.down_proj` over `Rayon` optimized threads:
+### Execution Footprints (Qwen2-0.5B-Instruct, `model.layers.0.mlp.down_proj`)
+
+Built with `RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example`.
 
 ```
-=== Phase 2: Offline Calibration ===
-Offline Data-Driven Thresholds Extracted: t4 = 0.0013, t8 = 0.0296
+=== Offline Calibration ===
+Extracted thresholds: t4 = 0.014399, t8 = 0.422365
+Sparse delta NNZ: 606183 / 4358144 (86.09% sparsity)
 
-=== Phase 3: Real Model Compression via SaccadeEngine ===
-Saccade: Intercepting and compiling model.layers.0.mlp.down_proj.weight
-Successfully compiled 1 layers.
+=== Run 1: Vanilla Dense FP16 Baseline ===
+  [Vanilla] Prose (Low Volatility)      ~5.6ms  (~1800 tok/s)   BPT: 16.00
+  [Vanilla] Logic (Medium Volatility)   ~5.5ms  (~1810 tok/s)   BPT: 16.00
+  [Vanilla] Code  (High Volatility)     ~5.7ms  (~1748 tok/s)   BPT: 16.00
+  Weight memory: 8.31 MB
 
-=== Phase 4: Online Inference Benchmarks ===
-Benchmark [Prose (Low Volatility)]: Execution Time = 59.12ms
-Benchmark [Logic (Medium Volatility)]: Execution Time = 57.49ms
-Benchmark [Code (High Volatility)]: Execution Time = 57.51ms
+=== Run 2: Saccade C-TARQ Adaptive ===
+  [Saccade] Prose (Low Volatility)     ~68ms   (~148 tok/s)    BPT: 4.00
+  [Saccade] Logic (Medium Volatility)  ~85ms   (~118 tok/s)    BPT: 5.11
+  [Saccade] Code  (High Volatility)    ~76ms   (~131 tok/s)    BPT: 5.11
+  Weight memory: 4.97 MB
+
+Compression ratio: 1.7x (8.31 MB → 4.97 MB)
 ```
 
-### Architectural Soundness Analysis: Data-Driven Scaling
-By eliminating hardcoded heuristic fallbacks and extracting explicit standard deviations mapped tightly via the `calibration::ProfileRunner`, we ensure the generated token routing accurately models expected parameter paths:
-1. **Dynamic Engine Routing:** The system successfully embeds calibration bounds (e.g., `t4 = 0.0013`, `t8 = 0.0296`) into the native `.safetensors` headers. 
-2. **Stable Throughput:** Under un-fused variable execution pathways, the model operates safely under heavy 57-59ms loops dynamically bypassing memory limitations natively relying completely on dynamic activation routing thresholds to switch execution pipelines safely.
+### Architectural Soundness Analysis
+
+1. **Dynamic Engine Routing:** The system embeds calibration bounds (`t4 = 0.014399`, `t8 = 0.422365`) into the tensor map and extracts them at compile time. Token routing is verified via per-profile classification: Prose routes to base-only, Logic to Q8 delta, Code to FP16 fallback.
+2. **Fused Register Unpacking:** The inner 4-bit weight extraction loop is manually unrolled across 8 lanes with constant shift amounts, enabling AVX2/SSE auto-vectorization by the Rust compiler.
+3. **HPC Kernel Optimizations:** Token activations are converted from f16→f32 once per token (not per row), row-scale factors are applied once after column accumulation, and bounds-checks are bypassed via `get_unchecked` in the hot path.
+4. **Graceful Delta Fallback:** When `sparse_delta_fp16` is unavailable, high-volatility tokens fall back to `sparse_delta_q8` corrections rather than silently computing base-only weights.
+5. **Memory-Throughput Tradeoff:** The vanilla baseline leverages `gemm`-backed `matmul` on contiguous FP16 buffers. Saccade trades raw throughput for 1.7x memory compression — the target operating point for edge devices where DRAM bandwidth is the constraint.
+
+### Metrics Collected
+
+| Metric | Description |
+|--------|-------------|
+| Wall-clock latency | Per-profile execution time excluding model loading |
+| Throughput | Tokens per second per profile |
+| Memory footprint | Dense FP16 vs. packed 4-bit + CSR overhead |
+| Bits-per-token (BPT) | Dynamic precision budget: 4.0 (base) to ~5.11 (delta) |
 
 ---
 
 ## Running the End-to-End Example
 
-We have shipped a self-contained mock simulating this entire environment pipeline. It compresses an isolated linear shape simulating a standard Qwen intermediate MLP mapping, generates varied execution tokens, and executes the sequence dynamically.
+The benchmark harness downloads Qwen2-0.5B-Instruct, runs offline calibration, compiles the target layer, and executes both vanilla and Saccade pipelines with comparative output.
 
-**Execute:**
+**Execute (release mode with native SIMD):**
 ```bash
-cargo run --bin qwen_example
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example
+```
+
+For the minimal validation harness:
+```bash
+cargo run --release --bin verify
 ```
