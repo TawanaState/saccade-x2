@@ -116,26 +116,65 @@ pub enum ProjectionLayer {
 
 Attention layers always use `Standard` (precision-sensitive). MLP layers use `Saccade` when loaded from a compressed checkpoint.
 
-### Two-Phase Kernel with CSC Sparse Format
+### Two-Phase Kernel with Pipelined Accumulators and CSC Sparse Format
 
-The execution kernel separates base computation from sparse correction:
+**Phase 1 (Base — Rayon-parallel):** 4-bit matrix multiply with 4 independent accumulators.
 
-**Phase 1 (Base):** Rayon-parallel 4-bit matrix multiply → f32 accumulator buffer. Each thread processes independent rows with no shared state.
+FMA instructions have 4-cycle latency but 0.5-cycle throughput on modern x86 CPUs. A single accumulator (`acc += a*b`) creates a serial dependency chain where only 1 FMA can be issued per 4 cycles — wasting 87.5% of the FPU pipeline. Since Rust does not enable `-ffast-math`, the compiler cannot reorder these into independent chains.
 
-**Phase 2 (Sparse):** Sequential CSC (Compressed Sparse Column) correction. Column-sequential iteration reads the activation cache contiguously (prefetch-friendly), and row-indexed writes target the 6KB accumulator buffer (L1-resident). This replaces the CSR pointer-chasing loop that performed ~1,337 scattered reads per row.
+The fix: manually distribute the 8 per-u32 FMAs across 4 independent accumulators (a0–a3). Each accumulator receives 2 FMAs per loop iteration with 2 intervening independent FMAs between consecutive uses — enough pipeline separation to hide the latency and approach the 0.5-cycle throughput limit.
+
+This single change yielded a **3.2x speedup** on the base computation path (2.8ms → 0.88ms per token for the 1536×8960 down_proj layer).
+
+**Phase 2 (Sparse — Sequential CSC):** Column-sequential iteration reads the activation cache contiguously (prefetch-friendly), and row-indexed writes target the 6KB accumulator buffer (L1-resident). Values are pre-scaled to f32 at construction time, leaving a single FMA per non-zero element.
 
 **Phase 3 (Convert):** f32 accumulator → f16 output.
 
 ### Pre-Cached Kernel Data
 
 All execution data is extracted from Tensors once at construction time and stored as `KernelCache`:
-- `packed_weights: Vec<u32>` — base weights
+- `packed_weights: Vec<u32>` — base weights (eliminates per-call Tensor guard acquisition)
 - `scales_f32: Vec<f32>` — row scales (pre-converted from f16)
-- `csc: Option<CachedCsc>` — sparse corrections in CSC format with pre-scaled f32 values
+- `csc: Option<CachedCsc>` — sparse corrections transposed from CSR to CSC format with pre-scaled f32 values
 
-This eliminates per-call Tensor guard acquisition and Vec memcpy that accumulated to ~144ms overhead across 72 MLP layers per token in full-model inference.
+This eliminates per-call Tensor guard acquisition, Vec memcpy, and CSR→CSC conversion that accumulated to ~144ms overhead across 72 MLP layers per token in full-model inference.
 
 ---
+
+## Benchmark Results (Qwen2-1.5B-Instruct, `model.layers.0.mlp.down_proj`)
+
+Built with `$env:RUSTFLAGS="-C target-cpu=native"; cargo run --release --bin qwen_example`.
+
+```
+Target layer: 1536 x 8960 (13.76M params)
+Sparse delta NNZ: 2,054,984 / 13,762,560 (85.07% sparsity)
+BPT: 5.19 (within 5.11–5.29 target)
+
+GEMV Benchmark (batch=1, autoregressive decoding):
+  [Vanilla GEMV] Prose    2265 µs/tok  (441 tok/s)
+  [Vanilla GEMV] Logic    2171 µs/tok  (461 tok/s)
+  [Vanilla GEMV] Code     2237 µs/tok  (447 tok/s)
+  [Saccade GEMV] Prose     878 µs/tok  (1138 tok/s)  ← 2.58x FASTER
+  [Saccade GEMV] Logic    2766 µs/tok  (362 tok/s)
+  [Saccade GEMV] Code     2631 µs/tok  (380 tok/s)
+
+GEMM Benchmark (batch=10):
+  [Vanilla GEMM] Prose    7.3ms  (1371 tok/s)
+  [Saccade GEMM] Prose    7.9ms  (1266 tok/s)  ← near-parity
+
+Memory: 26.25 MB (FP16) → 16.37 MB (Saccade) = 1.6x compression
+```
+
+### Performance Progression
+
+| Stage | Prose GEMV | Logic GEMV | Key Change |
+|-------|-----------|-----------|------------|
+| Original (v3.0) | ~600ms/10tok | ~600ms/10tok | Flat throughput illusion |
+| + Unrolled unpacking (v3.1) | 156ms/10tok | 123ms/10tok | SIMD-friendly nibble extraction |
+| + HPC kernel (v3.2) | 68ms/10tok | 85ms/10tok | Upfront f16 cache, factored scale |
+| + Rayon + GEMV bench (v3.3) | 2.3ms/tok | 5.4ms/tok | Multi-core, dual benchmark |
+| + Pre-cached CSC (v3.4) | 2.8ms/tok | 5.4ms/tok | Eliminated Tensor extraction |
+| + Pipelined accumulators (v3.5) | **0.88ms/tok** | **2.8ms/tok** | 4-accumulator FMA pipeline |
 
 ## Build & Run
 

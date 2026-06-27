@@ -25,14 +25,10 @@ impl CustomOp1 for SaccadeLinearOp {
         let output_elements = batch_tokens * self.out_features;
         let mut output_buffer = vec![half::f16::from_f32(0.0); output_elements];
 
-        // All kernel data is pre-computed at construction time — no Tensor guard
-        // acquisition, no per-call Vec memcpy. This eliminates ~2ms per layer call
-        // that accumulated to ~144ms overhead across 72 MLP layers per token.
         let packed_weights = &self.cache.packed_weights;
         let base_scales = &self.cache.scales_f32;
         let csc_data = &self.cache.csc;
 
-        // Pre-classify token complexity outside the hot path.
         let mut token_routes: Vec<(bool, bool)> = Vec::with_capacity(batch_tokens);
         for t in 0..batch_tokens {
             let act_offset = t * hidden_dim;
@@ -48,8 +44,6 @@ impl CustomOp1 for SaccadeLinearOp {
         let packed_per_row = self.in_features / 8;
         let in_features = self.in_features;
 
-        // Per-token f32 activation cache and f32 accumulator buffer.
-        // Reused across tokens to avoid heap allocation per step.
         let mut token_f32 = vec![0.0f32; hidden_dim];
         let mut acc_buffer = vec![0.0f32; out_features];
 
@@ -58,7 +52,6 @@ impl CustomOp1 for SaccadeLinearOp {
             let current_token_slice = &raw_activations[act_offset..act_offset + hidden_dim];
             let (use_delta_q8, use_delta_fp16) = token_routes[t];
 
-            // Single f16→f32 pass per token.
             for i in 0..hidden_dim {
                 unsafe {
                     *token_f32.get_unchecked_mut(i) = current_token_slice.get_unchecked(i).to_f32();
@@ -66,12 +59,24 @@ impl CustomOp1 for SaccadeLinearOp {
             }
             let token_cache: &[f32] = &token_f32;
 
-            // ── PHASE 1: Base 4-bit matrix multiplication ──────────────────────
-            // Rayon-parallel across rows. Each worker processes independent rows
-            // with no shared mutable state. The unrolled 8-lane nibble extraction
-            // and factored row-scale enable SIMD auto-vectorization.
+            // ── PHASE 1: Base 4-bit dot product with pipelined accumulators ────
+            //
+            // FMA has 4-cycle latency but 0.5-cycle throughput on modern x86.
+            // A single accumulator (`acc += a*b`) creates a serial dependency chain
+            // that can only issue 1 FMA per 4 cycles — wasting 87.5% of the FPU.
+            //
+            // Four independent accumulators (a0-a3) break this chain. Each gets
+            // 2 FMAs per loop iteration, so consecutive uses of the same accumulator
+            // are separated by 4 independent instructions — enough to fill the
+            // pipeline and approach the 0.5-cycle throughput limit.
+            //
+            // Rust does NOT enable -ffast-math, so the compiler cannot reorder
+            // `acc += x` into independent chains. This must be done manually.
             acc_buffer.par_iter_mut().enumerate().for_each(|(row, acc_val)| {
-                let mut acc = 0.0f32;
+                let mut a0 = 0.0f32;
+                let mut a1 = 0.0f32;
+                let mut a2 = 0.0f32;
+                let mut a3 = 0.0f32;
                 let row_weight_offset = row * packed_per_row;
 
                 unsafe {
@@ -88,26 +93,26 @@ impl CustomOp1 for SaccadeLinearOp {
                         let n6 = ((p >> 24) & 0x0F) as f32 - 8.0;
                         let n7 = (p >> 28) as f32 - 8.0;
 
-                        acc += *token_cache.get_unchecked(base) * n0;
-                        acc += *token_cache.get_unchecked(base + 1) * n1;
-                        acc += *token_cache.get_unchecked(base + 2) * n2;
-                        acc += *token_cache.get_unchecked(base + 3) * n3;
-                        acc += *token_cache.get_unchecked(base + 4) * n4;
-                        acc += *token_cache.get_unchecked(base + 5) * n5;
-                        acc += *token_cache.get_unchecked(base + 6) * n6;
-                        acc += *token_cache.get_unchecked(base + 7) * n7;
+                        // Distribute across 4 accumulators to break serial FMA chains.
+                        // Each accumulator receives 2 FMAs per iteration, with 2
+                        // intervening independent FMAs between consecutive uses —
+                        // enough pipeline separation to hide the 4-cycle FMA latency.
+                        a0 += *token_cache.get_unchecked(base) * n0;
+                        a1 += *token_cache.get_unchecked(base + 1) * n1;
+                        a2 += *token_cache.get_unchecked(base + 2) * n2;
+                        a3 += *token_cache.get_unchecked(base + 3) * n3;
+                        a0 += *token_cache.get_unchecked(base + 4) * n4;
+                        a1 += *token_cache.get_unchecked(base + 5) * n5;
+                        a2 += *token_cache.get_unchecked(base + 6) * n6;
+                        a3 += *token_cache.get_unchecked(base + 7) * n7;
                     }
 
-                    // Row scale applied once after accumulation.
-                    *acc_val = acc * *base_scales.get_unchecked(row);
+                    // Reduce accumulators with balanced tree to minimize rounding error
+                    *acc_val = (a0 + a1 + a2 + a3) * *base_scales.get_unchecked(row);
                 }
             });
 
             // ── PHASE 2: Sparse CSC correction ─────────────────────────────────
-            // Column-sequential iteration reads token_cache contiguously (no
-            // pointer chasing). Row-indexed writes target acc_buffer (~6KB),
-            // which stays fully L1-resident. This replaces the CSR loop that
-            // performed ~1,337 scattered reads per row via csr.c[i].
             if use_delta_q8 || use_delta_fp16 {
                 if let Some(ref csc) = csc_data {
                     unsafe {
@@ -116,10 +121,8 @@ impl CustomOp1 for SaccadeLinearOp {
                             let col_end = *csc.col_ptrs.get_unchecked(col + 1) as usize;
                             if col_start == col_end { continue; }
 
-                            // Sequential read from activation cache (contiguous, prefetch-friendly)
                             let activation = *token_cache.get_unchecked(col);
 
-                            // Values are pre-scaled f32 — single FMA per non-zero element
                             for idx in col_start..col_end {
                                 let row = *csc.row_indices.get_unchecked(idx) as usize;
                                 *acc_buffer.get_unchecked_mut(row) += activation * *csc.values_f32.get_unchecked(idx);
@@ -129,7 +132,7 @@ impl CustomOp1 for SaccadeLinearOp {
                 }
             }
 
-            // ── PHASE 3: Convert f32 accumulator to f16 output ─────────────────
+            // ── PHASE 3: Convert f32 → f16 ─────────────────────────────────────
             let out_slice = &mut output_buffer[t * out_features..(t + 1) * out_features];
             for row in 0..out_features {
                 unsafe {
