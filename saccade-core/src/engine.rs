@@ -73,15 +73,14 @@ impl SaccadeEngine {
                     }
                 }
 
-                let saccade_op = SaccadeLinearOp {
+                let saccade_op = SaccadeLinearOp::new(
                     packed_base,
                     scale_base,
                     sparse_delta_q8,
-                    sparse_delta_fp16: None, // Simplified to symmetric Q8 blocks as per v3 specs
-                    config: layer_config,
+                    layer_config,
                     out_features,
                     in_features,
-                };
+                )?;
                 
                 layers.insert(base_name.to_string(), saccade_op);
             }

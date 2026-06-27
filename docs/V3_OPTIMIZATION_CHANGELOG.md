@@ -116,17 +116,24 @@ pub enum ProjectionLayer {
 
 Attention layers always use `Standard` (precision-sensitive). MLP layers use `Saccade` when loaded from a compressed checkpoint.
 
-### Adaptive Parallelism
+### Two-Phase Kernel with CSC Sparse Format
 
-The `cpu_fwd` kernel selects sequential or parallel execution based on matrix size:
+The execution kernel separates base computation from sparse correction:
 
-```rust
-if out_features * packed_per_row >= 65536 {
-    out_slice.par_iter_mut().enumerate().for_each(compute_row);
-} else {
-    out_slice.iter_mut().enumerate().for_each(compute_row);
-}
-```
+**Phase 1 (Base):** Rayon-parallel 4-bit matrix multiply → f32 accumulator buffer. Each thread processes independent rows with no shared state.
+
+**Phase 2 (Sparse):** Sequential CSC (Compressed Sparse Column) correction. Column-sequential iteration reads the activation cache contiguously (prefetch-friendly), and row-indexed writes target the 6KB accumulator buffer (L1-resident). This replaces the CSR pointer-chasing loop that performed ~1,337 scattered reads per row.
+
+**Phase 3 (Convert):** f32 accumulator → f16 output.
+
+### Pre-Cached Kernel Data
+
+All execution data is extracted from Tensors once at construction time and stored as `KernelCache`:
+- `packed_weights: Vec<u32>` — base weights
+- `scales_f32: Vec<f32>` — row scales (pre-converted from f16)
+- `csc: Option<CachedCsc>` — sparse corrections in CSC format with pre-scaled f32 values
+
+This eliminates per-call Tensor guard acquisition and Vec memcpy that accumulated to ~144ms overhead across 72 MLP layers per token in full-model inference.
 
 ---
 

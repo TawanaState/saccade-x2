@@ -465,15 +465,7 @@ impl Qwen2Model {
             None
         };
 
-        Ok(SaccadeLinearOp {
-            packed_base,
-            scale_base,
-            sparse_delta_q8,
-            sparse_delta_fp16: None,
-            config: cfg.clone(),
-            out_features,
-            in_features,
-        })
+        SaccadeLinearOp::new(packed_base, scale_base, sparse_delta_q8, cfg.clone(), out_features, in_features)
     }
 
     fn causal_mask(&self, seq_len: usize, offset: usize, device: &Device) -> Result<Tensor> {

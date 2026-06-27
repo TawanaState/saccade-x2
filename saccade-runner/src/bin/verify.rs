@@ -73,15 +73,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         heuristic: saccade_core::variance_heuristic,
     };
 
-    let saccade_linear = SaccadeLinearOp {
-        packed_base: loaded_packed_base,
-        scale_base: loaded_scale_base,
+    let saccade_linear = SaccadeLinearOp::new(
+        loaded_packed_base,
+        loaded_scale_base,
         sparse_delta_q8,
-        sparse_delta_fp16: None,
         config,
         out_features,
         in_features,
-    };
+    )?;
 
     println!("Saccade Linear Operator Initialized.");
 
