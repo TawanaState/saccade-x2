@@ -1,208 +1,241 @@
 # Saccade-Candle Developer Guide
 
-Welcome to the internal execution guide for Saccade V3 on the Candle framework. This guide details how to take standard model structures (such as Qwen 2 or standard MLPs) and hook them into Saccade's execution backend.
+Welcome to the developer guide for Saccade V3, a token-adaptive matrix compression engine built on Hugging Face's Candle framework. This guide covers the full pipeline: from compressing a standard HuggingFace model to running streaming inference with real-time telemetry.
+
+---
 
 ## The Objective
 
-Our goal is to execute machine learning matrices mathematically equivalent to $Y = X \cdot W^T + b$ while preventing structural out-of-memory errors on limited hardware.
+Saccade executes matrix multiplications mathematically equivalent to $Y = X \cdot W^T$ while reducing memory footprint and improving inference throughput on CPU hardware. Instead of computing in dense FP16, it processes tightly-packed 4-bit base weights with sparse INT8 corrections (CSC format), dynamically adjusting precision per token based on activation complexity.
 
-Instead of computing purely in FP16, Saccade acts as a plugin. It processes a tightly-packed 4-bit representation of the baseline matrix (`W_base`), unpacking it dynamically in fast CPU SIMD registers, and adding sparse INT8/FP16 corrections (`ΔW`) only on specific sequence coordinates matching high token volatility.
+### Proven Results (Qwen2.5-0.5B-Instruct, 24 layers)
 
-## 1. The Offline Compression Loop
+| Metric | Vanilla FP16 | Saccade C-TARQ |
+|--------|-------------|----------------|
+| Decode speed | 5.8 tok/s | **7.4 tok/s (1.28x faster)** |
+| Memory footprint | 1264.81 MB | **718.27 MB (1.76x smaller)** |
+| Precision budget | 16.00 BPT | ~5.19 BPT |
 
-Before evaluating a model, you must map standard weights into our compact representations. This generally requires a calibration dataset to pinpoint volatile variance patches.
+---
 
-### The Artifacts Produced:
-For every target sub-module (e.g., `mlp.up_proj`), your compression suite must generate:
-1. **`packed_base`**: A Tensor of `u32` containing symmetrically packed 4-bit representation of the baseline matrix.
-2. **`scale_base`**: A row-wise array containing `f16` or `f32` scalar shifts needed to project the 4-bit integer values back to coordinate spaces.
-3. **`delta_q8_blocks`**: An `f16` or quantized `i8` coordinate matrix storing targeted precision corrections.
+## Quick Start
 
-### Archiving with Safetensors:
-Store these isolated components inside standard Hugging Face mapped binaries.
-```rust
-let mut compressed_state = HashMap::new();
-compressed_state.insert("packed_base".to_string(), packed_base_tensor);
-compressed_state.insert("scale_base".to_string(), scale_base_tensor);
-compressed_state.insert("delta_q8".to_string(), delta_q8_blocks_tensor);
+### Prerequisites
 
-candle_core::safetensors::save(&compressed_state, "compressed_layer.safetensors")?;
+- Rust toolchain (edition 2021+)
+- A calibration text file (any `.txt` with representative text)
+- A tokenizer.json for your target model (download from HuggingFace)
+
+### 1. Compile a Model
+
+```bash
+cargo run --release --bin saccade-compile -- \
+  --model-id Qwen/Qwen2.5-0.5B-Instruct \
+  --calib-file calibration.txt \
+  --output-path saccade_qwen.safetensors \
+  --tokenizer tokenizer.json
+```
+
+This downloads the model from HF Hub, compresses all 72 MLP projections (24 layers × gate/up/down), and outputs a unified safetensors archive.
+
+### 2. Run Inference (Saccade)
+
+```bash
+cargo run --release --bin saccade-run -- \
+  --checkpoint saccade_qwen.safetensors \
+  --tokenizer tokenizer.json \
+  --prompt "Explain how prime numbers work." \
+  --max-tokens 100
+```
+
+### 3. Compare Against Vanilla Baseline
+
+```bash
+cargo run --release --bin saccade-run -- \
+  --model-id Qwen/Qwen2.5-0.5B-Instruct \
+  --tokenizer tokenizer.json \
+  --prompt "Explain how prime numbers work." \
+  --max-tokens 100
+```
+
+### PowerShell (Windows) — Enable Native SIMD
+
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo build --release
 ```
 
 ---
 
-## 2. Setting Execution Thresholds
+## Architecture Overview
 
-The magic behind Saccade's computational routing is the **Global Activation Variance Heuristic**, configured by `SaccadeConfig`.
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    SACCADE TOOLKIT PIPELINE                     │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  [HF Model] ──► saccade-compile ──► [Saccade Checkpoint]      │
+│                      ▲                       │                 │
+│               [calibration.txt]              ▼                 │
+│                                        saccade-run             │
+│  [User Prompt] ──────────────────────►       │                 │
+│                                              ▼                 │
+│                                     Terminal Stream            │
+│                                     + Telemetry Dashboard      │
+└────────────────────────────────────────────────────────────────┘
+```
 
-These thresholds represent absolute structural thresholds defined during your calibration phases:
+---
 
-### Using Custom Developer Heuristics
+## 1. The Compression Pipeline (`saccade-compile`)
 
-The evaluation architecture is built for maximum developer friendliness, allowing researchers to inject completely customized mathematical routing constraints.
+### What It Does
 
-By default, we supply `variance_heuristic` and `l2_norm_heuristic`. You can apply your own `fn(&[half::f16]) -> f32` functions.
+For each MLP linear projection (gate_proj, up_proj, down_proj) across all transformer layers:
+
+1. **4-bit base quantization:** Each row's weights are symmetrically quantized to signed 4-bit integers ([-8, +7]) using row-wise max-abs scaling. Eight 4-bit values pack into one `u32`.
+
+2. **Sparse delta extraction:** Reconstruction errors exceeding a percentile-based threshold are stored as INT8 values in Compressed Sparse Column (CSC) format. The threshold is computed per-layer from the actual error distribution to guarantee a target fill rate (default 15%).
+
+3. **Routing threshold calibration:** Token activation variance is profiled using the calibration text. Percentile-based thresholds (t4, t8) are embedded into the checkpoint to drive runtime precision routing.
+
+### CLI Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-id` | required | HuggingFace repository (e.g., `Qwen/Qwen2.5-0.5B-Instruct`) |
+| `--calib-file` | required | Plain-text file for calibration profiling |
+| `--output-path` | `saccade_model.safetensors` | Output checkpoint path |
+| `--tokenizer` | auto-download | Path to tokenizer.json |
+| `--target-fill` | `0.15` | Fraction of weights receiving sparse corrections |
+| `--pct-t4` | `0.80` | Percentile for medium-volatility routing threshold |
+| `--pct-t8` | `0.95` | Percentile for high-volatility routing threshold |
+
+### Output Format
+
+The checkpoint is a standard HuggingFace safetensors file containing:
+
+**Compressed MLP layers** (per layer per projection):
+- `model.layers.{i}.mlp.{proj}.saccade_packed_base` — u32 packed 4-bit weights
+- `model.layers.{i}.mlp.{proj}.saccade_scale_base` — f16 row-wise scales
+- `model.layers.{i}.mlp.{proj}.saccade_delta_*` — CSR sparse corrections
+
+**Uncompressed layers** (kept as-is):
+- Attention projections (q/k/v/o), layer norms, embeddings, lm_head
+
+**Routing metadata:**
+- `model.layers.{i}.saccade_t4` / `saccade_t8` — per-layer routing thresholds
+
+---
+
+## 2. The Runtime Engine (`saccade-run`)
+
+### Dual-Mode Architecture
+
+**Saccade mode** (`--checkpoint`): Loads compressed safetensors, constructs `Qwen2Model` with `ProjectionLayer::Saccade` for MLP layers. Attention layers remain standard `candle_nn::Linear`.
+
+**Vanilla mode** (`--model-id`): Downloads uncompressed model, constructs the same `Qwen2Model` with `ProjectionLayer::Standard` for all layers. This ensures a fair comparison — same model code, same generation loop, only the MLP kernel differs.
+
+### CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--checkpoint <path>` | Saccade mode: path to compiled safetensors |
+| `--model-id <repo>` | Vanilla mode: HF model repository |
+| `--prompt <text>` | Input prompt |
+| `--tokenizer <path>` | Path to tokenizer.json |
+| `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
+| `--temperature <f>` | Sampling temperature (default: 0.7, 0 = greedy) |
+| `--top-p <f>` | Nucleus sampling threshold |
+| `--seed <N>` | Random seed (default: 42) |
+
+### Telemetry Output
+
+```
+================================================================
+           SACCADE PERFORMANCE AUDIT TELEMETRY LOG
+================================================================
+Execution Mode:          Saccade C-TARQ Adaptive
+Total Tokens Decoded:    50
+----------------------------------------------------------------
+Prefill Latency:         1134.0 ms
+Decode Latency:          135.45 ms/token
+Generation Speed:        7.4 tokens/second
+Weight Memory Footprint: 718.27 MB
+================================================================
+```
+
+---
+
+## 3. Custom Heuristics
+
+The routing system supports pluggable complexity metrics via function pointers:
 
 ```rust
 use saccade_core::{SaccadeConfig, variance_heuristic};
 
-// Option A: Use built-in heuristics
+// Built-in: statistical variance (recommended)
 let config = SaccadeConfig {
-    t4: 2.0, // Threshold to trigger sparse 8-bit updates
-    t8: 8.0, // Threshold to trigger dense FP16 updates
+    t4: 0.000252,
+    t8: 0.000341,
     block_size: 16,
     heuristic: variance_heuristic,
 };
 
-// Option B: Write your own totally dynamic routing calibration function!
-fn my_custom_activation_routing(tokens: &[half::f16]) -> f32 {
-    let mut max_val = 0.0f32;
-    for &t in tokens {
-        if t.to_f32().abs() > max_val { max_val = t.to_f32().abs(); }
-    }
-    max_val // Route dynamically off the absolute maximum spike!
+// Custom: route by absolute maximum spike
+fn max_activation_heuristic(tokens: &[half::f16]) -> f32 {
+    tokens.iter().map(|t| t.to_f32().abs()).fold(0.0f32, f32::max)
 }
-
-let custom_config = SaccadeConfig {
-    t4: 15.0,
-    t8: 30.0,
-    block_size: 16,
-    heuristic: my_custom_activation_routing,
-};
 ```
 
 ---
 
-## 3. Creating the Intercept Wrap
+## 4. The Execution Kernel
 
-Candle layers are heavily constructed using the native `VarBuilder`. To inject Saccade, you bypass standard definitions of `candle_nn::Linear` to instantiate our operator (`SaccadeLinearOp`).
+The `SaccadeLinearOp` implements Candle's `CustomOp1` trait with a three-phase kernel:
 
-```rust
-use saccade_core::SaccadeLinearOp;
+**Phase 1 (Base):** Rayon-parallel 4-bit dot product with 4 pipelined FMA accumulators. Each u32 contains 8 nibble-packed weights that are extracted with constant shifts, multiplied against pre-cached f32 activations, and accumulated into independent accumulators to break FMA serial dependency chains.
 
-let loaded_tensors = candle_core::safetensors::load("compressed_layer.safetensors", &device)?;
+**Phase 2 (Sparse):** Sequential CSC column-sweep. For tokens exceeding the routing threshold, sparse INT8 corrections are applied via column-sequential iteration — contiguous activation reads, L1-hot accumulator writes.
 
-let saccade_plugin = SaccadeLinearOp {
-    packed_base: loaded_tensors.get("packed_base").unwrap().clone(),
-    scale_base: loaded_tensors.get("scale_base").unwrap().clone(),
-    delta_q8_blocks: loaded_tensors.get("delta_q8").unwrap().clone(),
-    delta_q8_scales: None,
-    delta_fp16_blocks: None,
-    config,
-    out_features: 64,
-    in_features: 128,
-};
-```
+**Phase 3 (Convert):** f32 accumulator to f16 output.
+
+All kernel data (packed weights, scales, CSC arrays) is pre-extracted from Tensors at `SaccadeLinearOp::new()` construction time, eliminating per-forward-call overhead.
 
 ---
 
-## 4. Operational Execution (Forward Pass)
+## 5. Micro-Benchmarks
 
-The `SaccadeLinearOp` fundamentally implements Candle's `CustomOp1` trait. Once integrated into the macro structure of a model, any incoming activation (`X`) calling `apply_op1_no_bwd` evaluates token dimensions on-the-fly without the host Python-style synchronizations that crippled V1.
-
-```rust
-// Generate your autoregressive context vector
-let incoming_activations = Tensor::new(...);
-
-// Evaluates using adaptive Rayon multi-threading and SIMD register unpacking
-let output_matrix = incoming_activations.apply_op1_no_bwd(&saccade_plugin)?;
-```
-
-The returned tensor naturally merges with the next network graph layer, allowing standard model continuation.
-
----
-
-## 5. Benchmarking and Footprint Optimization
-
-The benchmarking harness performs a comparative analysis between vanilla dense FP16 execution and Saccade's adaptive C-TARQ pipeline across two scenarios:
-
-- **GEMM (batch=10):** Simulates prefill/prompt encoding — matrix-matrix multiply, compute-bound.
-- **GEMV (batch=1):** Simulates autoregressive text generation — matrix-vector product, memory-bandwidth-bound. This is the deployment scenario Saccade was engineered for.
-
-### Execution Footprints (Qwen2-1.5B-Instruct, `model.layers.0.mlp.down_proj`)
-
-Built with `RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example`.
-
-```
-Target layer: 1536 x 8960 (13.76M params)
-Extracted thresholds: t4 = 0.014398, t8 = 0.422364
-Sparse delta NNZ: 53241 / 13762560 (99.61% sparsity)
-
-GEMM Benchmark (batch=10):
-  [Vanilla GEMM] Prose    ~12ms   (812 tok/s)
-  [Vanilla GEMM] Logic    ~7ms    (1431 tok/s)
-  [Vanilla GEMM] Code     ~6ms    (1651 tok/s)
-  [Saccade GEMM] Prose    ~20ms   (505 tok/s)   BPT: 4.00
-  [Saccade GEMM] Logic    ~21ms   (474 tok/s)   BPT: 4.03
-  [Saccade GEMM] Code     ~19ms   (528 tok/s)   BPT: 4.03
-
-GEMV Benchmark (batch=1, autoregressive decoding):
-  [Vanilla GEMV] Prose    2175 µs/tok  (460 tok/s)
-  [Vanilla GEMV] Logic    2158 µs/tok  (463 tok/s)
-  [Vanilla GEMV] Code     2154 µs/tok  (464 tok/s)
-  [Saccade GEMV] Prose    2279 µs/tok  (439 tok/s)   BPT: 4.00
-  [Saccade GEMV] Logic    2174 µs/tok  (460 tok/s)   BPT: 4.03
-  [Saccade GEMV] Code     1992 µs/tok  (502 tok/s)   BPT: 4.03
-
-Memory: 26.25 MB (FP16) → 6.83 MB (Saccade) = 3.8x compression
-```
-
-### Architectural Soundness Analysis
-
-1. **Dynamic Engine Routing:** Calibration bounds (`t4`, `t8`) are embedded into the tensor map and extracted at compile time. Token routing is verified per-profile: Prose→base-only, Logic→Q8 delta, Code→FP16 fallback.
-2. **GEMV Throughput Parity:** In the autoregressive decoding scenario (batch=1), Saccade achieves throughput parity with vanilla FP16 while delivering 3.8x memory compression. Code tokens are 7.5% faster due to reduced data volume.
-3. **HPC Kernel:** Upfront f16→f32 cache conversion (896x fewer type conversions), factored row-scale multiplication (4,864x fewer FP muls), and unchecked pointer access enabling AVX2/SSE vectorization.
-4. **Adaptive Parallelism:** Rayon row parallelism engages only when the matrix size justifies fork-join coordination cost. Small layers run sequentially to avoid thread overhead.
-5. **Graceful Delta Fallback:** High-volatility tokens receive the best available sparse delta corrections regardless of which routing threshold they exceed.
-
-### Metrics Collected
-
-| Metric | Description |
-|--------|-------------|
-| Wall-clock latency | Per-profile execution time (GEMM: ms, GEMV: µs/tok) |
-| Throughput | Tokens per second per profile |
-| Memory footprint | Dense FP16 vs. packed 4-bit + CSR overhead |
-| Bits-per-token (BPT) | Dynamic precision budget: 4.0 (base) to ~4.03 (delta) |
-
----
-
-## Running the Production Toolkit
-
-### Model Compilation
-
-Compress a HuggingFace model into Saccade format, targeting all MLP layers across the full transformer:
+### Single-Layer GEMM/GEMV Comparison
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-compile -- \
-  --model-id Qwen/Qwen2.5-0.5B-Instruct \
-  --calib-file calibration.txt \
-  --output-path saccade_qwen.safetensors \
-  --target-fill 0.15
+cargo run --release --bin qwen_example
 ```
 
-The `--calib-file` accepts any plain-text file. The compiler tokenizes it, runs hybrid calibration through the first 4 model layers, extracts routing thresholds, and compresses all 72 MLP projections (24 layers × gate/up/down).
+Targets `model.layers.0.mlp.down_proj` on Qwen2-1.5B-Instruct with GEMM (batch=10, prefill) and GEMV (batch=1, autoregressive) benchmarks.
 
-### Streaming Inference
-
-Run inference with streaming token output and performance telemetry:
+### Correctness Validation
 
 ```bash
-# Saccade compressed mode
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-run -- \
-  --checkpoint saccade_qwen.safetensors \
-  --prompt "Explain the benefits of model compression" \
-  --max-tokens 100
-
-# Vanilla HF baseline mode
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-run -- \
-  --model-id Qwen/Qwen2.5-0.5B-Instruct \
-  --prompt "Explain the benefits of model compression" \
-  --max-tokens 100
+cargo run --release --bin verify
 ```
 
-### Micro-benchmarks
+Constructs a mock layer, serializes/loads via safetensors, and verifies that low-variance tokens use base-only computation while high-variance tokens trigger sparse corrections.
 
-```bash
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example  # GEMM/GEMV comparative
-RUSTFLAGS="-C target-cpu=native" cargo run --release --bin verify        # Minimal validation
-```
+---
+
+## 6. Project Structure
+
+| File | Purpose |
+|------|---------|
+| `saccade-core/src/config.rs` | Core types: `SaccadeLinearOp`, `KernelCache`, `CachedCsc` |
+| `saccade-core/src/op.rs` | `CustomOp1` impl: 3-phase pipelined kernel |
+| `saccade-core/src/compress.rs` | 4-bit quantization + sparse delta extraction |
+| `saccade-core/src/engine.rs` | `SaccadeEngine::compile_model_topology` |
+| `saccade-core/src/calibration.rs` | `ProfileRunner::calibrate` — percentile threshold extraction |
+| `saccade-core/src/heuristics.rs` | `variance_heuristic`, `l2_norm_heuristic` |
+| `saccade-runner/src/model.rs` | Qwen2 transformer with `ProjectionLayer` dual-mode |
+| `saccade-runner/src/bin/compile.rs` | `saccade-compile` CLI |
+| `saccade-runner/src/bin/run.rs` | `saccade-run` CLI |
+| `saccade-runner/src/bin/qwen_example.rs` | GEMM/GEMV micro-benchmark |
+| `saccade-runner/src/bin/verify.rs` | Correctness validation |

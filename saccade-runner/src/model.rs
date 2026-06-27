@@ -52,7 +52,14 @@ impl ProjectionLayer {
     pub fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Standard(l) => l.forward(xs),
-            Self::Saccade(op) => xs.apply_op1_no_bwd(op),
+            Self::Saccade(op) => {
+                // The Saccade kernel operates on F16 activations internally.
+                // Convert F32 model activations → F16 → custom op → F16 output → F32.
+                let orig_dtype = xs.dtype();
+                let xs_f16 = if orig_dtype != DType::F16 { xs.to_dtype(DType::F16)? } else { xs.clone() };
+                let out = xs_f16.apply_op1_no_bwd(op)?;
+                if orig_dtype != DType::F16 { out.to_dtype(orig_dtype) } else { Ok(out) }
+            }
         }
     }
 }
@@ -117,8 +124,10 @@ impl RotaryEmbedding {
             .to_dtype(DType::F32)?
             .reshape((max_seq, 1))?;
         let freqs = t.matmul(&inv_freq.reshape((1, head_dim / 2))?)?;
-        let cos = freqs.cos()?.to_dtype(dtype)?;
-        let sin = freqs.sin()?.to_dtype(dtype)?;
+        // Duplicate to full head_dim: each frequency applies to a pair of dimensions
+        let freqs_full = Tensor::cat(&[&freqs, &freqs], D::Minus1)?;
+        let cos = freqs_full.cos()?.to_dtype(dtype)?;
+        let sin = freqs_full.sin()?.to_dtype(dtype)?;
         Ok(Self { sin, cos })
     }
 
@@ -181,10 +190,11 @@ impl Attention {
     }
 
     fn from_tensors(rope: Arc<RotaryEmbedding>, cfg: &Qwen2Config, tensors: &HashMap<String, Tensor>, prefix: &str) -> Result<Self> {
+        // Auto-convert to F32 — Candle CPU doesn't support BF16 matmul
         let get = |name: &str| -> Result<Tensor> {
-            tensors.get(&format!("{}.{}", prefix, name))
-                .cloned()
-                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {}.{}", prefix, name)))
+            let t = tensors.get(&format!("{}.{}", prefix, name))
+                .ok_or_else(|| candle_core::Error::Msg(format!("Missing tensor: {}.{}", prefix, name)))?;
+            if t.dtype() != DType::F32 { t.to_dtype(DType::F32) } else { Ok(t.clone()) }
         };
         let hd = cfg.head_dim();
         let q_proj = candle_nn::Linear::new(get("q_proj.weight")?, Some(get("q_proj.bias")?));
@@ -350,7 +360,11 @@ impl Qwen2Model {
         }
 
         let norm = RmsNorm::load(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        let lm_head = if cfg.tie_word_embeddings || !vb.contains_tensor("lm_head.weight") {
+            candle_nn::Linear::new(embed_tokens.embeddings().clone(), None)
+        } else {
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
+        };
 
         Ok(Self {
             embed_tokens, layers, norm, lm_head,
@@ -364,11 +378,23 @@ impl Qwen2Model {
     /// Load a Saccade-compressed model from a raw tensor map.
     /// Detects compressed layers by checking for `saccade_packed_base` keys.
     pub fn from_saccade_checkpoint(cfg: &Qwen2Config, tensors: &HashMap<String, Tensor>, device: &Device) -> Result<Self> {
-        let dtype = DType::F16;
+        let dtype = DType::F32;
+
+        // Helper: convert any tensor to F32 for CPU matmul compatibility.
+        // Candle's CPU backend doesn't support BF16 matmul, and many HF models
+        // (including Qwen2.5) store weights in BF16.
+        let to_f32 = |t: &Tensor| -> Result<Tensor> {
+            if t.dtype() != DType::F32 {
+                t.to_dtype(DType::F32)
+            } else {
+                Ok(t.clone())
+            }
+        };
 
         let embed_w = tensors.get("model.embed_tokens.weight")
             .ok_or_else(|| candle_core::Error::Msg("Missing model.embed_tokens.weight".into()))?;
-        let embed_tokens = Embedding::new(embed_w.clone(), cfg.hidden_size);
+        let embed_w_f32 = to_f32(embed_w)?;
+        let embed_tokens = Embedding::new(embed_w_f32, cfg.hidden_size);
 
         let rope = Arc::new(RotaryEmbedding::new(dtype, cfg, device)?);
 
@@ -385,18 +411,18 @@ impl Qwen2Model {
             let ln2_w = tensors.get(&format!("model.layers.{}.post_attention_layernorm.weight", i))
                 .ok_or_else(|| candle_core::Error::Msg(format!("Missing post_attention_layernorm.weight for layer {}", i)))?;
 
-            let input_ln = RmsNorm::from_tensor(ln1_w.clone(), cfg.rms_norm_eps);
-            let post_ln = RmsNorm::from_tensor(ln2_w.clone(), cfg.rms_norm_eps);
+            let input_ln = RmsNorm::from_tensor(to_f32(ln1_w)?, cfg.rms_norm_eps);
+            let post_ln = RmsNorm::from_tensor(to_f32(ln2_w)?, cfg.rms_norm_eps);
             layers.push(DecoderLayer { self_attn: attn, mlp, input_layernorm: input_ln, post_attention_layernorm: post_ln });
         }
 
         let norm_w = tensors.get("model.norm.weight")
             .ok_or_else(|| candle_core::Error::Msg("Missing model.norm.weight".into()))?;
-        let norm = RmsNorm::from_tensor(norm_w.clone(), cfg.rms_norm_eps);
+        let norm = RmsNorm::from_tensor(to_f32(norm_w)?, cfg.rms_norm_eps);
 
-        let lm_head_w = tensors.get("lm_head.weight")
-            .ok_or_else(|| candle_core::Error::Msg("Missing lm_head.weight".into()))?;
-        let lm_head = candle_nn::Linear::new(lm_head_w.clone(), None);
+        // Qwen2.5 ties lm_head weights with embeddings — fall back to embed_tokens
+        let lm_head_w = tensors.get("lm_head.weight").unwrap_or(embed_w);
+        let lm_head = candle_nn::Linear::new(to_f32(lm_head_w)?, None);
 
         Ok(Self {
             embed_tokens, layers, norm, lm_head,
@@ -424,11 +450,11 @@ impl Qwen2Model {
             let down = Self::build_saccade_op(tensors, &format!("{}.down_proj", prefix), &saccade_cfg)?;
             Ok(Mlp::from_saccade(gate, up, down))
         } else {
-            // Standard: load raw weights
+            // Standard: load raw weights, converting to F32 for CPU matmul
             let get = |name: &str| -> Result<Tensor> {
-                tensors.get(&format!("{}.{}", prefix, name))
-                    .cloned()
-                    .ok_or_else(|| candle_core::Error::Msg(format!("Missing {}.{}", prefix, name)))
+                let t = tensors.get(&format!("{}.{}", prefix, name))
+                    .ok_or_else(|| candle_core::Error::Msg(format!("Missing {}.{}", prefix, name)))?;
+                if t.dtype() != DType::F32 { t.to_dtype(DType::F32) } else { Ok(t.clone()) }
             };
             let gate = candle_nn::Linear::new(get("gate_proj.weight")?, None);
             let up = candle_nn::Linear::new(get("up_proj.weight")?, None);

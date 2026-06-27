@@ -1,0 +1,40 @@
+# Writing Technical Documents with Markdown
+Markdown is a lightweight markup language designed to structure logical text and mathematical equations seamlessly. Writers use standard Markdown elements like headers, bulleted lists, and bold text to create a clear hierarchy and guide the reader through an argument. 
+
+When documentation requires technical formulas, Markdown integrates with LaTeX syntax to render crisp mathematical expressions. This integration happens in two distinct ways depending on the visual flow required:
+
+*   **Inline Mathematics**: Enclosing a formula within single dollar signs (`$`) places the math directly inside a sentence. For example, `$f(x) = y$` renders as $f(x) = y$. This keeps short equations or variable definitions from interrupting paragraph flow.
+*   **Display Mathematics**: Enclosing an equation within double dollar signs (`$$`) isolates the formula on its own line, centering it for visual emphasis. This is ideal for complex proofs, such as calculating a sum:
+
+$$\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$$
+## Processing Equations with JavaScript
+Web applications often use JavaScript to find and format these mathematical expressions dynamically. Libraries like 
+
+[MathJax](https://www.mathjax.org/)
+
+ or KaTeX scan the text for dollar-sign delimiters and replace them with properly styled HTML elements. 
+
+Below is a simple JavaScript function that uses a regular expression to find inline math patterns inside a string:
+```javascript
+// Function to locate inline math patterns in text
+function detectInlineMath(text) {
+  const inlineMathRegex = /\$([^\$]+)\$/g;
+  let match;
+  
+  while ((match = inlineMathRegex.exec(text)) !== null) {
+    console.log(`Found math expression: ${match[1]}`);
+  }
+}
+
+// Example usage
+const docText = "The function \(f(x) = x^2\) grows rapidly.";
+detectInlineMath(docText);
+```
+
+Using this separation of text, math, and code keeps technical documentation highly readable and easy to maintain across platforms like 
+
+[GitHub](https://github.com/)
+
+, Obsidian, and 
+
+[Jupyter Notebooks](https://jupyter.org/)
