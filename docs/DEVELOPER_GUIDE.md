@@ -152,3 +152,49 @@ Status: VERIFICATION SUCCESSFUL (Accuracy bounds maintained)
 | ↳ [`compile.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/compile.rs) | CLI binary | Quantization tool supporting wikitext auto-download and token limits. |
 | ↳ [`run.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/run.rs) | CLI binary | Text generator streaming assistants, supporting `--bypass` and telemetry reporting. |
 | ↳ [`verify.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/verify.rs) | CLI binary | Dual-mode accuracy audit comparing logit outputs and calculating speedup. |
+| ↳ [`api.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/api.rs) | `api` | Developer API exposing bypass control, telemetry logs, and custom model compilation helpers. |
+
+---
+
+## 6. Developer API Reference
+
+Saccade V4 provides a clean, unified programmatic API inside the `saccade-runner` crate for integration with benchmarking tools, custom runners, or evaluation suites.
+
+### A. API Overview
+Access the API by importing:
+```rust
+use saccade_runner::{SaccadeModelApi, SaccadeMetrics};
+```
+
+### B. API Methods
+
+#### `SaccadeModelApi::set_bypass(enabled: bool)`
+Toggles the global C-TARQ bypass switch.
+* `true`: All linear projections execute standard matrix multiplications using reconstructed weights, bypassing token routing.
+* `false`: Enables the adaptive C-TARQ 3-phase kernel.
+
+#### `SaccadeModelApi::reset_telemetry()`
+Resets the global thread-safe telemetry registry. Call before starting a benchmark or generation cycle to ensure clean readings.
+
+#### `SaccadeModelApi::get_metrics() -> SaccadeMetrics`
+Retrieves aggregated telemetry metrics from the runtime:
+```rust
+pub struct SaccadeMetrics {
+    /// Average Bits Per Token (BPT) of Saccade projections
+    pub average_bpt: f64,
+    /// Total duration spent inside Saccade kernels (in milliseconds)
+    pub kernel_ms: f64,
+    /// Total count of layer-tokens evaluated
+    pub layer_tokens_processed: u64,
+}
+```
+
+#### `SaccadeModelApi::compile_tensors(...) -> Result<HashMap<String, Tensor>>`
+Compiles an in-memory hashmap of standard dense weights into a Saccade C-TARQ quantized state map.
+* **Arguments**:
+  * `tensors`: Reference to `HashMap<String, Tensor>` loaded from standard model weights.
+  * `target_layers`: Substrings of weights to target (e.g. `&["gate_proj", "up_proj"]`).
+  * `calibration_activations`: 2D activation tensor used to calibrate thresholds.
+  * `target_fill_rate`: Fraction of elements with sparse deltas (e.g. `0.15`).
+  * `pct_t4` and `pct_t8`: Percentiles for routing thresholds (e.g. `0.80`, `0.95`).
+

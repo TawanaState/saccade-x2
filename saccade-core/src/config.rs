@@ -37,6 +37,7 @@ pub struct SparseDeltaMatrix {
 /// writes target a small accumulator buffer (~6KB) that stays L1-resident.
 /// Values are pre-scaled to f32 at construction time, eliminating i8→f32 conversion and
 /// scale multiplication from the hot path — leaving just one FMA per non-zero element.
+#[derive(Clone)]
 pub struct CachedCsc {
     pub col_ptrs: Vec<u32>,
     pub row_indices: Vec<u32>,
@@ -46,6 +47,7 @@ pub struct CachedCsc {
 /// Pre-extracted kernel execution data. Populated once at construction time to eliminate
 /// per-forward-call Tensor guard acquisition and Vec memcpy overhead. For full-model
 /// inference (72 layer calls per token), this saves ~144ms of per-call extraction overhead.
+#[derive(Clone)]
 pub struct KernelCache {
     pub packed_weights: Vec<u32>,
     pub scales_f32: Vec<f32>,
@@ -54,6 +56,7 @@ pub struct KernelCache {
 }
 
 /// Persistent in-memory storage layout for an optimized Saccade linear projection.
+#[derive(Clone)]
 pub struct SaccadeLinearOp {
     pub packed_base: Tensor,
     pub scale_base: Tensor,
@@ -63,6 +66,7 @@ pub struct SaccadeLinearOp {
     pub out_features: usize,
     pub in_features: usize,
     pub cache: KernelCache,
+    pub dequantized_weight: Tensor,
 }
 
 impl SaccadeLinearOp {
@@ -135,12 +139,14 @@ impl SaccadeLinearOp {
             }
         }
 
+        let dequantized_weight = Tensor::from_vec(dequantized_weight_f32.clone(), (out_features, in_features), packed_base.device())?;
+
         let cache = KernelCache { packed_weights, scales_f32, csc, dequantized_weight_f32 };
 
 
         Ok(Self {
             packed_base, scale_base, sparse_delta_q8, sparse_delta_fp16: None,
-            config, out_features, in_features, cache,
+            config, out_features, in_features, cache, dequantized_weight,
         })
     }
 

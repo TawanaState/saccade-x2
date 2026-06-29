@@ -3,4 +3,11 @@ members = [
     "saccade-core",
     "saccade-runner"
 ]
+exclude = ["candle"]
 resolver = "2"
+
+[patch.crates-io]
+candle-core = { path = "candle/candle-core" }
+candle-nn = { path = "candle/candle-nn" }
+candle-transformers = { path = "candle/candle-transformers" }
+
