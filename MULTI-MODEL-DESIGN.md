@@ -168,11 +168,11 @@ saccade-run --checkpoint saccade_model.safetensors --prompt "Implement a lock-fr
 
 To implement this global architecture framework, the development team will prioritize the following deployment actions:
 
-* **Phase 1: Establish the Core Framework Fork (Target: 3 Days)**
+* **Phase 1: Establish the Core Framework Fork**
 Clone the main Hugging Face `candle` repository. Refactor `candle-nn::Linear` to support our dual-backend system, ensuring that non-quantized weights flow through native unquantized execution paths with zero performance loss.
-* **Phase 2: Migrate Core Operators to KernelCache Layouts (Target: 3 Days)**
+* **Phase 2: Migrate Core Operators to KernelCache Layouts**
 Update `SaccadeLinearOp` to ingest pre-compiled data states from our new framework-level `LinearBackend` configuration. Port our unrolled 4-accumulator FMA pipelines and column-major CSC transformation loops directly into the core crate layout.
-* **Phase 3: Update Serialization & Verification Suites (Target: 2 Days)**
+* **Phase 3: Update Serialization & Verification Suites**
 Modify `saccade-compile` to export layers directly using standard `candle_nn::Linear` names, embedding routing thresholds ($t_4, t_8$) and compression tracking parameters cleanly into the Safetensors JSON header dictionary. Run end-to-end decoding benchmarks across the 0.5B and 1.5B scales to confirm performance stability.
 
 By shifting our implementation from custom model forks to a framework-level injection layer, we eliminate architectural debt, provide universal multi-model compatibility, and position Saccade as a highly practical platform for accelerating diverse models on consumer edge devices.
