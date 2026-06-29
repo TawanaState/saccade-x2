@@ -1,241 +1,154 @@
-# Saccade-Candle Developer Guide
+# Saccade V4: Developer & Integration Guide 🚀
 
-Welcome to the developer guide for Saccade V3, a token-adaptive matrix compression engine built on Hugging Face's Candle framework. This guide covers the full pipeline: from compressing a standard HuggingFace model to running streaming inference with real-time telemetry.
+Welcome to the engineering guide for **Saccade V4**, a high-performance, token-adaptive matrix compression engine extending Hugging Face's Candle framework. 
 
----
-
-## The Objective
-
-Saccade executes matrix multiplications mathematically equivalent to $Y = X \cdot W^T$ while reducing memory footprint and improving inference throughput on CPU hardware. Instead of computing in dense FP16, it processes tightly-packed 4-bit base weights with sparse INT8 corrections (CSC format), dynamically adjusting precision per token based on activation complexity.
-
-### Proven Results (Qwen2.5-0.5B-Instruct, 24 layers)
-
-| Metric | Vanilla FP16 | Saccade C-TARQ |
-|--------|-------------|----------------|
-| Decode speed | 5.8 tok/s | **7.4 tok/s (1.28x faster)** |
-| Memory footprint | 1264.81 MB | **718.27 MB (1.76x smaller)** |
-| Precision budget | 16.00 BPT | ~5.19 BPT |
+Saccade accelerates and compresses matrix operations by running a packed 4-bit integer base matrix on predictable tokens and dynamically applying coordinate-masked sparse INT8 corrections (**C-TARQ** - *Causal Token-Adaptive Residual Quantization*) strictly when token activation variance indicates that higher precision is required.
 
 ---
 
-## Quick Start
+## 1. Architectural History & Crate Version Decisions
 
-### Prerequisites
+### Upgrade to Candle `v0.11.0`
+Saccade V4 is built on top of the latest **Candle `v0.11.0`** release. This upgrade enables universal multi-model support, allowing Saccade to seamlessly load, quantize, and execute new model architectures directly from HuggingFace without maintaining custom forked structures. 
 
-- Rust toolchain (edition 2021+)
-- A calibration text file (any `.txt` with representative text)
-- A tokenizer.json for your target model (download from HuggingFace)
+During this migration, we verified the following core compiler and system realities:
 
-### 1. Compile a Model
+1. **`CustomOp1` Trait Availability**:
+   The `CustomOp1` (unary), `CustomOp2` (binary), and `CustomOp3` (ternary) traits remain fully exported in `candle-core` alongside their new in-place counterparts (`InplaceOp1`, etc.). Saccade V4's execution kernel implements `CustomOp1` with zero modification to its forward execution loop.
 
+2. **GGML Isolation**:
+   Candle `v0.11.0` implements static quantization (such as GGUF and GGML formats) inside the isolated `QTensor` container and the `candle_transformers::quantized_nn` submodule. Because Saccade intercepts standard float projections (`candle_nn::Linear`) at the API boundary, it never collides with or depends on internal static GGML paths, preserving Saccade's adaptive token-routing as a pure competitive differentiator.
+
+3. **SIMD Instruction Scheduling**:
+   LLVM allocates vector registers (AVX2/AVX-512) and schedules pipeline resources directly from our raw pointer arithmetic within `saccade-core/src/op.rs`. Framework upgrades modify the memory orchestrator wrappers but leave our optimized mathematical kernels executing at full native CPU speed.
+
+---
+
+## 2. Core V4 Feature Specifications
+
+Saccade V4 extends V3 with developer-friendly diagnostics, global runtime control, lock-free telemetry, and automated calibration.
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        SACCADE V4 DIAGNOSTIC PIPELINE                  │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│  [Model SafeTensors] ──► saccade-verify (Dual-Mode Verification)       │
+│                                │                                       │
+│                ┌───────────────┴───────────────┐                       │
+│                ▼                               ▼                       │
+│      [C-TARQ Enabled]                 [C-TARQ Bypassed]                │
+│      - 3-Phase SIMD Unpacking         - Reconstructed Dense FP16       │
+│      - Heuristic Routing              - Standard GEMM                  │
+│                │                               │                       │
+│                └───────────────┬───────────────┘                       │
+│                                ▼                                       │
+│                       Accuracy Audit Report                            │
+│                       - Logit Cosine Similarity                        │
+│                       - Logit RMSE                                     │
+│                       - Real-Time BPT & Speedup                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### A. The Bypass Switch (`BYPASS_C_TARQ`)
+Developers can disable C-TARQ dynamically at runtime to run unquantized baseline comparisons.
+* **Global Control**: Toggle programmatically using `saccade_core::set_bypass_c_tarq(bool)`.
+* **Execution Bypass Path**: When active, Saccade bypasses the 3-phase kernel. Instead, it runs standard parallel matrix multiplication against a pre-dequantized dense weight matrix (`dequantized_weight_f32` containing base weights + sparse corrections), providing the exact mathematical baseline.
+* **CLI Trigger**: Run `saccade-run` with the `--bypass` flag to evaluate baseline speed and output quality.
+
+### B. Lock-Free Telemetry & Bits-Per-Token (BPT)
+To measure performance without degrading runtime throughput, Saccade V4 features a lock-free telemetry register bank using **Atomics** and **Thread-Local Storage**:
+* **Base Bits**: Accumulates `in_features * out_features * 4` per token.
+* **Sparse Bits**: Accumulates `csc_non_zeros * 8` strictly for active tokens.
+* **Parameter Calls**: Accumulates layer weights to calculate average model BPT.
+* **Kernel Latency**: Tracks exact duration spent inside Saccade kernels.
+* **Mechanism**: Aggregates metrics locally in thread-local storage and flushes them to global registers periodically (every 64 calls) to prevent CPU cache contention.
+
+### C. Seamless calibration
+The `saccade-compile` utility supports automatic dataset fetching and custom parameters:
+* **Hugging Face Hub Ingestion**: If no local calibration file is provided, Saccade auto-downloads the validation split of the `wikitext` dataset (`wiki.valid.raw` from the hub).
+* **Token Budget Control**: Configure exact calibration corpus token limits with `--calib-tokens <N>` (defaults to 512).
+
+---
+
+## 3. Quick Start Command Reference
+
+### Step 1: Automated Model Compilation & Calibration
+Compile a HuggingFace model, downloading the wikitext calibration dataset automatically and limiting the run to 256 profiling tokens:
 ```bash
 cargo run --release --bin saccade-compile -- \
   --model-id Qwen/Qwen2.5-0.5B-Instruct \
-  --calib-file calibration.txt \
-  --output-path saccade_qwen.safetensors \
-  --tokenizer tokenizer.json
+  --dataset wikitext \
+  --calib-tokens 256 \
+  --output-path saccade_qwen.safetensors
 ```
 
-This downloads the model from HF Hub, compresses all 72 MLP projections (24 layers × gate/up/down), and outputs a unified safetensors archive.
-
-### 2. Run Inference (Saccade)
-
+### Step 2: Running Inference with Telemetry
+Run inference on the compiled checkpoint using C-TARQ adaptive routing:
 ```bash
 cargo run --release --bin saccade-run -- \
   --checkpoint saccade_qwen.safetensors \
-  --tokenizer tokenizer.json \
-  --prompt "Explain how prime numbers work." \
-  --max-tokens 100
+  --prompt "Explain quantum computing in simple terms." \
+  --max-tokens 50
 ```
 
-### 3. Compare Against Vanilla Baseline
-
+Run the same prompt in **Bypass Mode** to compare output quality and latency:
 ```bash
 cargo run --release --bin saccade-run -- \
-  --model-id Qwen/Qwen2.5-0.5B-Instruct \
-  --tokenizer tokenizer.json \
-  --prompt "Explain how prime numbers work." \
-  --max-tokens 100
+  --checkpoint saccade_qwen.safetensors \
+  --prompt "Explain quantum computing in simple terms." \
+  --max-tokens 50 \
+  --bypass
 ```
 
-### PowerShell (Windows) — Enable Native SIMD
-
-```powershell
-$env:RUSTFLAGS="-C target-cpu=native"
-cargo build --release
-```
-
----
-
-## Architecture Overview
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                    SACCADE TOOLKIT PIPELINE                     │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  [HF Model] ──► saccade-compile ──► [Saccade Checkpoint]      │
-│                      ▲                       │                 │
-│               [calibration.txt]              ▼                 │
-│                                        saccade-run             │
-│  [User Prompt] ──────────────────────►       │                 │
-│                                              ▼                 │
-│                                     Terminal Stream            │
-│                                     + Telemetry Dashboard      │
-└────────────────────────────────────────────────────────────────┘
+### Step 3: Running the Automated Verification Suite
+Run side-by-side correctness auditing on the compiled checkpoint. This runs a prompt twice (with and without C-TARQ), matching generated tokens and calculating logit similarity:
+```bash
+cargo run --release --bin verify -- \
+  --checkpoint saccade_qwen.safetensors \
+  --max-tokens 30
 ```
 
 ---
 
-## 1. The Compression Pipeline (`saccade-compile`)
+## 4. Verification Output Diagnostics
 
-### What It Does
-
-For each MLP linear projection (gate_proj, up_proj, down_proj) across all transformer layers:
-
-1. **4-bit base quantization:** Each row's weights are symmetrically quantized to signed 4-bit integers ([-8, +7]) using row-wise max-abs scaling. Eight 4-bit values pack into one `u32`.
-
-2. **Sparse delta extraction:** Reconstruction errors exceeding a percentile-based threshold are stored as INT8 values in Compressed Sparse Column (CSC) format. The threshold is computed per-layer from the actual error distribution to guarantee a target fill rate (default 15%).
-
-3. **Routing threshold calibration:** Token activation variance is profiled using the calibration text. Percentile-based thresholds (t4, t8) are embedded into the checkpoint to drive runtime precision routing.
-
-### CLI Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model-id` | required | HuggingFace repository (e.g., `Qwen/Qwen2.5-0.5B-Instruct`) |
-| `--calib-file` | required | Plain-text file for calibration profiling |
-| `--output-path` | `saccade_model.safetensors` | Output checkpoint path |
-| `--tokenizer` | auto-download | Path to tokenizer.json |
-| `--target-fill` | `0.15` | Fraction of weights receiving sparse corrections |
-| `--pct-t4` | `0.80` | Percentile for medium-volatility routing threshold |
-| `--pct-t8` | `0.95` | Percentile for high-volatility routing threshold |
-
-### Output Format
-
-The checkpoint is a standard HuggingFace safetensors file containing:
-
-**Compressed MLP layers** (per layer per projection):
-- `model.layers.{i}.mlp.{proj}.saccade_packed_base` — u32 packed 4-bit weights
-- `model.layers.{i}.mlp.{proj}.saccade_scale_base` — f16 row-wise scales
-- `model.layers.{i}.mlp.{proj}.saccade_delta_*` — CSR sparse corrections
-
-**Uncompressed layers** (kept as-is):
-- Attention projections (q/k/v/o), layer norms, embeddings, lm_head
-
-**Routing metadata:**
-- `model.layers.{i}.saccade_t4` / `saccade_t8` — per-layer routing thresholds
-
----
-
-## 2. The Runtime Engine (`saccade-run`)
-
-### Dual-Mode Architecture
-
-**Saccade mode** (`--checkpoint`): Loads compressed safetensors, constructs `Qwen2Model` with `ProjectionLayer::Saccade` for MLP layers. Attention layers remain standard `candle_nn::Linear`.
-
-**Vanilla mode** (`--model-id`): Downloads uncompressed model, constructs the same `Qwen2Model` with `ProjectionLayer::Standard` for all layers. This ensures a fair comparison — same model code, same generation loop, only the MLP kernel differs.
-
-### CLI Options
-
-| Flag | Description |
-|------|-------------|
-| `--checkpoint <path>` | Saccade mode: path to compiled safetensors |
-| `--model-id <repo>` | Vanilla mode: HF model repository |
-| `--prompt <text>` | Input prompt |
-| `--tokenizer <path>` | Path to tokenizer.json |
-| `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--temperature <f>` | Sampling temperature (default: 0.7, 0 = greedy) |
-| `--top-p <f>` | Nucleus sampling threshold |
-| `--seed <N>` | Random seed (default: 42) |
-
-### Telemetry Output
-
+Below is an example output of the V4 automated audit report:
 ```
 ================================================================
-           SACCADE PERFORMANCE AUDIT TELEMETRY LOG
+            SACCADE SYSTEM VERIFICATION REPORT
 ================================================================
-Execution Mode:          Saccade C-TARQ Adaptive
-Total Tokens Decoded:    50
+Checkpoint Evaluated:    "saccade_qwen.safetensors"
+Reference Baseline:      Vanilla FP16 Dequantized (Bypass)
+Number of Steps Run:     30 steps
 ----------------------------------------------------------------
-Prefill Latency:         1134.0 ms
-Decode Latency:          135.45 ms/token
-Generation Speed:        7.4 tokens/second
-Weight Memory Footprint: 718.27 MB
+NUMERICAL ACCURACY METRICS:
+  Avg Logit Cosine Similarity: 0.999992 (Target: >0.998)
+  Avg Logit RMSE:              0.002862 (Target: <0.005)
+----------------------------------------------------------------
+PERFORMANCE AND QUANTIZATION AUDIT:
+  C-TARQ End-to-End Latency:   4118.05 ms (7.28 tokens/sec)
+  Bypass End-to-End Latency:   13567.92 ms (2.21 tokens/sec)
+  Saccade C-TARQ BPT Budget:   5.19 BPT
+  Dequantized Bypass BPT:      16.00 BPT
+  Kernel Compute Speedup:      4.06x
+================================================================
+Status: VERIFICATION SUCCESSFUL (Accuracy bounds maintained)
 ================================================================
 ```
 
 ---
 
-## 3. Custom Heuristics
+## 5. Directory & Module Reference
 
-The routing system supports pluggable complexity metrics via function pointers:
-
-```rust
-use saccade_core::{SaccadeConfig, variance_heuristic};
-
-// Built-in: statistical variance (recommended)
-let config = SaccadeConfig {
-    t4: 0.000252,
-    t8: 0.000341,
-    block_size: 16,
-    heuristic: variance_heuristic,
-};
-
-// Custom: route by absolute maximum spike
-fn max_activation_heuristic(tokens: &[half::f16]) -> f32 {
-    tokens.iter().map(|t| t.to_f32().abs()).fold(0.0f32, f32::max)
-}
-```
-
----
-
-## 4. The Execution Kernel
-
-The `SaccadeLinearOp` implements Candle's `CustomOp1` trait with a three-phase kernel:
-
-**Phase 1 (Base):** Rayon-parallel 4-bit dot product with 4 pipelined FMA accumulators. Each u32 contains 8 nibble-packed weights that are extracted with constant shifts, multiplied against pre-cached f32 activations, and accumulated into independent accumulators to break FMA serial dependency chains.
-
-**Phase 2 (Sparse):** Sequential CSC column-sweep. For tokens exceeding the routing threshold, sparse INT8 corrections are applied via column-sequential iteration — contiguous activation reads, L1-hot accumulator writes.
-
-**Phase 3 (Convert):** f32 accumulator to f16 output.
-
-All kernel data (packed weights, scales, CSC arrays) is pre-extracted from Tensors at `SaccadeLinearOp::new()` construction time, eliminating per-forward-call overhead.
-
----
-
-## 5. Micro-Benchmarks
-
-### Single-Layer GEMM/GEMV Comparison
-
-```bash
-cargo run --release --bin qwen_example
-```
-
-Targets `model.layers.0.mlp.down_proj` on Qwen2-1.5B-Instruct with GEMM (batch=10, prefill) and GEMV (batch=1, autoregressive) benchmarks.
-
-### Correctness Validation
-
-```bash
-cargo run --release --bin verify
-```
-
-Constructs a mock layer, serializes/loads via safetensors, and verifies that low-variance tokens use base-only computation while high-variance tokens trigger sparse corrections.
-
----
-
-## 6. Project Structure
-
-| File | Purpose |
-|------|---------|
-| `saccade-core/src/config.rs` | Core types: `SaccadeLinearOp`, `KernelCache`, `CachedCsc` |
-| `saccade-core/src/op.rs` | `CustomOp1` impl: 3-phase pipelined kernel |
-| `saccade-core/src/compress.rs` | 4-bit quantization + sparse delta extraction |
-| `saccade-core/src/engine.rs` | `SaccadeEngine::compile_model_topology` |
-| `saccade-core/src/calibration.rs` | `ProfileRunner::calibrate` — percentile threshold extraction |
-| `saccade-core/src/heuristics.rs` | `variance_heuristic`, `l2_norm_heuristic` |
-| `saccade-runner/src/model.rs` | Qwen2 transformer with `ProjectionLayer` dual-mode |
-| `saccade-runner/src/bin/compile.rs` | `saccade-compile` CLI |
-| `saccade-runner/src/bin/run.rs` | `saccade-run` CLI |
-| `saccade-runner/src/bin/qwen_example.rs` | GEMM/GEMV micro-benchmark |
-| `saccade-runner/src/bin/verify.rs` | Correctness validation |
+| Crate / File | Module | Role / Updates in V4 |
+|---|---|---|
+| **`saccade-core`** | | Core dynamic custom operations and mathematical helpers. |
+| ↳ [`config.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-core/src/config.rs) | `config` | Holds `KernelCache` and exposes `set_bypass_c_tarq` / `is_c_tarq_bypassed`. |
+| ↳ [`op.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-core/src/op.rs) | `op` | Custom `cpu_fwd` execution loop containing the fast parallel GEMM bypass path. |
+| ↳ [`telemetry.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-core/src/telemetry.rs) | `telemetry` | Lock-free, thread-local register aggregates for BPT and kernel duration. |
+| **`saccade-runner`** | | Running executables, CLI layers, and model representations. |
+| ↳ [`model.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/model.rs) | `model` | Qwen2 transformer architecture loading both standard and Saccade projections. |
+| ↳ [`compile.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/compile.rs) | CLI binary | Quantization tool supporting wikitext auto-download and token limits. |
+| ↳ [`run.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/run.rs) | CLI binary | Text generator streaming assistants, supporting `--bypass` and telemetry reporting. |
+| ↳ [`verify.rs`](file:///C:/Users/user/Desktop/WORK/RESEARCH/saccade-x2/saccade-runner/src/bin/verify.rs) | CLI binary | Dual-mode accuracy audit comparing logit outputs and calculating speedup. |

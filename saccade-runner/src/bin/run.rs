@@ -45,6 +45,10 @@ struct Args {
     /// Path to tokenizer.json (auto-downloaded if not provided)
     #[arg(long)]
     tokenizer: Option<PathBuf>,
+
+    /// Bypass Saccade's token-adaptive C-TARQ routing logic and run standard dense matrix multiplication
+    #[arg(long)]
+    bypass: bool,
 }
 
 struct GenerationTelemetry {
@@ -53,11 +57,18 @@ struct GenerationTelemetry {
     decode_ms: f64,
     mode: String,
     weight_bytes: usize,
+    avg_bpt: f64,
+    kernel_ms: f64,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let device = Device::Cpu;
+
+    // Configure Saccade bypass switch
+    saccade_core::set_bypass_c_tarq(args.bypass);
+    // Reset global telemetry registers
+    saccade_core::telemetry::TELEMETRY.reset();
 
     let (mut model, tokenizer, _cfg, telemetry_mode, weight_bytes) = match (&args.checkpoint, &args.model_id) {
         (Some(checkpoint), None) => load_saccade(&checkpoint, &device, args.tokenizer.as_ref())?,
@@ -134,12 +145,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n");
 
     // Telemetry
+    saccade_core::telemetry::flush_telemetry();
+    let base_bits = saccade_core::telemetry::TELEMETRY.total_base_bits.load(std::sync::atomic::Ordering::Relaxed);
+    let sparse_bits = saccade_core::telemetry::TELEMETRY.total_sparse_bits.load(std::sync::atomic::Ordering::Relaxed);
+    let total_param_calls = saccade_core::telemetry::TELEMETRY.total_param_calls.load(std::sync::atomic::Ordering::Relaxed);
+    let kernel_ns = saccade_core::telemetry::TELEMETRY.total_elapsed_ns.load(std::sync::atomic::Ordering::Relaxed);
+
+    let avg_bpt = if total_param_calls > 0 {
+        (base_bits + sparse_bits) as f64 / total_param_calls as f64
+    } else {
+        16.0
+    };
+    let kernel_ms = kernel_ns as f64 / 1_000_000.0;
+
     let telemetry = GenerationTelemetry {
         total_tokens: generated_tokens.len(),
         prefill_ms,
         decode_ms,
-        mode: telemetry_mode.clone(),
+        mode: if args.bypass { format!("{} (Bypassed C-TARQ)", telemetry_mode) } else { telemetry_mode.clone() },
         weight_bytes,
+        avg_bpt,
+        kernel_ms,
     };
     print_telemetry(&telemetry, decode_tokens);
 
@@ -337,6 +363,8 @@ fn print_telemetry(t: &GenerationTelemetry, decode_tokens: usize) {
     println!("Decode Latency:          {:.2} ms/token", ms_per_tok);
     println!("Generation Speed:        {:.1} tokens/second", decode_tok_per_sec);
     println!("Weight Memory Footprint: {:.2} MB", t.weight_bytes as f64 / (1024.0 * 1024.0));
+    println!("Average Model BPT:       {:.2} BPT", t.avg_bpt);
+    println!("Saccade Kernel Time:     {:.1} ms ({:.1}% of model time)", t.kernel_ms, (t.kernel_ms / (t.prefill_ms + t.decode_ms) * 100.0).min(100.0));
     println!("================================================================");
 }
 

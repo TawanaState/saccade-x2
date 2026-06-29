@@ -1,4 +1,15 @@
 use candle_core::Tensor;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub static BYPASS_C_TARQ: AtomicBool = AtomicBool::new(false);
+
+pub fn set_bypass_c_tarq(val: bool) {
+    BYPASS_C_TARQ.store(val, Ordering::SeqCst);
+}
+
+pub fn is_c_tarq_bypassed() -> bool {
+    BYPASS_C_TARQ.load(Ordering::SeqCst)
+}
 
 /// A function pointer defining the dynamic strategy used to calculate a complexity score for a single token slice.
 pub type HeuristicFn = fn(&[half::f16]) -> f32;
@@ -39,6 +50,7 @@ pub struct KernelCache {
     pub packed_weights: Vec<u32>,
     pub scales_f32: Vec<f32>,
     pub csc: Option<CachedCsc>,
+    pub dequantized_weight_f32: Vec<f32>,
 }
 
 /// Persistent in-memory storage layout for an optimized Saccade linear projection.
@@ -75,7 +87,7 @@ impl SaccadeLinearOp {
         };
 
         // Extract and pre-convert scales from f16 to f32
-        let scales_f32 = {
+        let scales_f32: Vec<f32> = {
             let (store, _) = scale_base.storage_and_layout();
             match &*store {
                 candle_core::Storage::Cpu(cpu) => {
@@ -92,7 +104,39 @@ impl SaccadeLinearOp {
             None
         };
 
-        let cache = KernelCache { packed_weights, scales_f32, csc };
+        // Pre-compute dequantized weights (base + sparse deltas) for standard GEMM bypass
+        let mut dequantized_weight_f32 = vec![0.0f32; out_features * in_features];
+        let packed_per_row = in_features / 8;
+        for row in 0..out_features {
+            let scale = scales_f32[row];
+            let row_offset = row * packed_per_row;
+            let dest_row_offset = row * in_features;
+            for k in 0..packed_per_row {
+                let p = packed_weights[row_offset + k];
+                let base = k * 8;
+                for idx in 0..8 {
+                    let u_val = (p >> (idx * 4)) & 0x0F;
+                    let q_val = (u_val as i32) - 8;
+                    dequantized_weight_f32[dest_row_offset + base + idx] = (q_val as f32) * scale;
+                }
+            }
+        }
+
+        // Add sparse corrections to the dequantized weights
+        if let Some(ref csc_data) = csc {
+            for col in 0..in_features {
+                let col_start = csc_data.col_ptrs[col] as usize;
+                let col_end = csc_data.col_ptrs[col + 1] as usize;
+                for idx in col_start..col_end {
+                    let row = csc_data.row_indices[idx] as usize;
+                    let val = csc_data.values_f32[idx];
+                    dequantized_weight_f32[row * in_features + col] += val;
+                }
+            }
+        }
+
+        let cache = KernelCache { packed_weights, scales_f32, csc, dequantized_weight_f32 };
+
 
         Ok(Self {
             packed_base, scale_base, sparse_delta_q8, sparse_delta_fp16: None,

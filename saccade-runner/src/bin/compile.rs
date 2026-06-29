@@ -19,7 +19,15 @@ struct Args {
 
     /// Path to a plain-text calibration file for threshold extraction
     #[arg(long)]
-    calib_file: PathBuf,
+    calib_file: Option<PathBuf>,
+
+    /// Calibration dataset name (e.g. "wikitext") if no --calib-file is provided
+    #[arg(long, default_value = "wikitext")]
+    dataset: String,
+
+    /// Number of tokens to use for calibration profiling
+    #[arg(long, default_value_t = 512)]
+    calib_tokens: usize,
 
     /// Output path for the compressed safetensors archive
     #[arg(long, default_value = "saccade_model.safetensors")]
@@ -85,8 +93,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ---- 3. Calibration ----
     println!("\n=== Phase 3: Calibration ===");
-    let calib_text = std::fs::read_to_string(&args.calib_file)?;
-    println!("Calibration text: {} chars", calib_text.len());
+    let calib_text = match &args.calib_file {
+        Some(path) => {
+            println!("Reading calibration file: {:?}", path);
+            std::fs::read_to_string(path)?
+        }
+        None => {
+            if args.dataset == "wikitext" {
+                println!("No calibration file provided. Auto-downloading 'wikitext' (wiki.valid.raw) from HuggingFace Hub...");
+                let path = hf_download("youssef-elgebaly/wikitext-2-raw-v1", "wiki.valid.raw")?;
+                std::fs::read_to_string(path)?
+            } else {
+                return Err(format!("Unsupported calibration dataset: {}. Please provide --calib-file instead.", args.dataset).into());
+            }
+        }
+    };
+    println!("Calibration text loaded: {} chars", calib_text.len());
 
     // Load tokenizer — from CLI flag, or download from HF Hub
     let tokenizer_path = if let Some(ref p) = args.tokenizer {
@@ -101,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let encoding = tokenizer.encode(calib_text.as_str(), true)
         .map_err(|e| format!("Tokenization failed: {}", e))?;
     let token_ids: Vec<u32> = encoding.get_ids().to_vec();
-    let num_tokens = token_ids.len().min(512);
+    let num_tokens = token_ids.len().min(args.calib_tokens);
     let token_ids = &token_ids[..num_tokens];
     println!("Tokenized {} calibration tokens.", num_tokens);
 

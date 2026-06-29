@@ -8,6 +8,7 @@ impl CustomOp1 for SaccadeLinearOp {
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
+        let start_time = std::time::Instant::now();
         let input_shape = layout.shape();
         let mut dims = input_shape.dims().to_vec();
         if let Some(last_dim) = dims.last_mut() {
@@ -24,6 +25,37 @@ impl CustomOp1 for SaccadeLinearOp {
 
         let output_elements = batch_tokens * self.out_features;
         let mut output_buffer = vec![half::f16::from_f32(0.0); output_elements];
+
+        // --- BYPASS SWITCH ---
+        if crate::config::is_c_tarq_bypassed() {
+            let dequantized_weight = &self.cache.dequantized_weight_f32;
+            let out_features = self.out_features;
+            let in_features = self.in_features;
+
+            output_buffer.par_chunks_mut(out_features).enumerate().for_each(|(t, out_slice)| {
+                let act_offset = t * in_features;
+                let current_token_slice = &raw_activations[act_offset..act_offset + in_features];
+                
+                for row in 0..out_features {
+                    let weight_row_offset = row * in_features;
+                    let mut acc = 0.0f32;
+                    for col in 0..in_features {
+                        unsafe {
+                            acc += current_token_slice.get_unchecked(col).to_f32() * 
+                                   dequantized_weight.get_unchecked(weight_row_offset + col);
+                        }
+                    }
+                    out_slice[row] = half::f16::from_f32(acc);
+                }
+
+                // Log bypass decision
+                crate::telemetry::log_bypass_decision(in_features, out_features);
+            });
+
+            let elapsed = start_time.elapsed().as_nanos() as u64;
+            crate::telemetry::TELEMETRY.total_elapsed_ns.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+            return Ok((CpuStorage::F16(output_buffer), out_shape));
+        }
 
         let packed_weights = &self.cache.packed_weights;
         let base_scales = &self.cache.scales_f32;
@@ -51,6 +83,11 @@ impl CustomOp1 for SaccadeLinearOp {
             let act_offset = t * hidden_dim;
             let current_token_slice = &raw_activations[act_offset..act_offset + hidden_dim];
             let (use_delta_q8, use_delta_fp16) = token_routes[t];
+
+            // Log routing decision
+            let is_sparse = use_delta_q8 || use_delta_fp16;
+            let csc_nnz = csc_data.as_ref().map(|c| c.values_f32.len()).unwrap_or(0);
+            crate::telemetry::log_routing_decision(is_sparse, in_features, out_features, csc_nnz);
 
             for i in 0..hidden_dim {
                 unsafe {
@@ -140,6 +177,9 @@ impl CustomOp1 for SaccadeLinearOp {
                 }
             }
         }
+
+        let elapsed = start_time.elapsed().as_nanos() as u64;
+        crate::telemetry::TELEMETRY.total_elapsed_ns.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
 
         Ok((CpuStorage::F16(output_buffer), out_shape))
     }
