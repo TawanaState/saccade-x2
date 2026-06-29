@@ -14,6 +14,10 @@ Saccade resolves severe DRAM memory-bandwidth constraints natively in Rust, achi
 
 ## Compilation & Usage
 
+First clone and install the whole repo, and its important sub modules:
+`git clone --recursive https://github.com/TawanaState/saccade-x2.git`
+Take note of the `--recursive` flag. 
+
 This project contains a highly modular engine (`saccade-core`) and an evaluation/test runner (`saccade-runner`).
 
 ### Local Verification
