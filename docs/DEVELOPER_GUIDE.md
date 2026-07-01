@@ -62,6 +62,7 @@ To measure performance without degrading runtime throughput, Saccade V4 features
 * **Sparse Bits**: Accumulates `csc_non_zeros * 8` strictly for active tokens.
 * **Parameter Calls**: Accumulates layer weights to calculate average model BPT.
 * **Kernel Latency**: Tracks exact duration spent inside Saccade kernels.
+* **Weight Memory Footprint (Static)**: Measures the static footprint of the tensors loaded from the `.safetensors` file. This value is computed once during initialization based on the checkpoint's tensor layout. Consequently, it remains identical whether running in Adaptive mode or Bypass mode, and does not represent dynamic runtime allocations (which also include pre-dequantized F32/F16 buffers for base projections).
 * **Mechanism**: Aggregates metrics locally in thread-local storage and flushes them to global registers periodically (every 64 calls) to prevent CPU cache contention.
 
 ### C. Seamless calibration
@@ -71,40 +72,111 @@ The `saccade-compile` utility supports automatic dataset fetching and custom par
 
 ---
 
-## 3. Quick Start Command Reference
+## 3. Quick Start & PowerShell Command Reference
+
+### CPU Performance Optimization (AVX2/AVX-512/FMA)
+To achieve native CPU performance and run at maximum speed, you **must** compile with the target CPU instruction set enabled. Without this, the compiler generates generic `x86_64` code which disables SIMD vectorized unpacking and hardware-accelerated FMA.
+* **PowerShell**: Set the environment variable in the current session before building or running:
+  ```powershell
+  $env:RUSTFLAGS="-C target-cpu=native"
+  ```
+* **Bash**: Prefix the environment variable:
+  ```bash
+  export RUSTFLAGS="-C target-cpu=native"
+  ```
+
+---
 
 ### Step 1: Automated Model Compilation & Calibration
 Compile a HuggingFace model, downloading the wikitext calibration dataset automatically and limiting the run to 256 profiling tokens:
+
+**PowerShell / Command Prompt (with `$env:`):**
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin saccade-compile -- --model-id Qwen/Qwen2.5-0.5B-Instruct --dataset wikitext --calib-tokens 256 --output-path saccade_qwen.safetensors
+```
+
+**Bash:**
 ```bash
-cargo run --release --bin saccade-compile -- \
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-compile -- \
   --model-id Qwen/Qwen2.5-0.5B-Instruct \
   --dataset wikitext \
   --calib-tokens 256 \
   --output-path saccade_qwen.safetensors
 ```
 
+---
+
 ### Step 2: Running Inference with Telemetry
-Run inference on the compiled checkpoint using C-TARQ adaptive routing:
+Run inference on the compiled Qwen checkpoint using C-TARQ adaptive routing:
+
+**PowerShell:**
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin saccade-run -- --checkpoint saccade_qwen.safetensors --prompt "Explain quantum computing in simple terms." --max-tokens 50
+```
+
+To compare output quality and latency, run the same prompt in **Bypass Mode**:
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin saccade-run -- --checkpoint saccade_qwen.safetensors --prompt "Explain quantum computing in simple terms." --max-tokens 50 --bypass
+```
+
+**Bash:**
 ```bash
-cargo run --release --bin saccade-run -- \
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin saccade-run -- \
   --checkpoint saccade_qwen.safetensors \
   --prompt "Explain quantum computing in simple terms." \
   --max-tokens 50
 ```
 
-Run the same prompt in **Bypass Mode** to compare output quality and latency:
-```bash
-cargo run --release --bin saccade-run -- \
-  --checkpoint saccade_qwen.safetensors \
-  --prompt "Explain quantum computing in simple terms." \
-  --max-tokens 50 \
-  --bypass
+---
+
+### Step 3: Running the Interception Examples (Qwen & Whisper)
+These standalone binaries use the Developer API to automatically compile, load, and run the models directly, demonstrating runtime interception.
+
+#### Qwen Interception Example
+Compiles the target projections, saves the checkpoint to `qwen2_saccade_example.safetensors`, mounts Saccade backends, and benchmarks inference:
+
+**PowerShell:**
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin qwen_example
 ```
 
-### Step 3: Running the Automated Verification Suite
-Run side-by-side correctness auditing on the compiled checkpoint. This runs a prompt twice (with and without C-TARQ), matching generated tokens and calculating logit similarity:
+**Bash:**
 ```bash
-cargo run --release --bin verify -- \
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin qwen_example
+```
+
+#### Whisper Interception Example
+Loads `openai/whisper-tiny`, decodes/pre-processes audio (from local wav or downloading default JFK wav), runs calibration, compiles target FFN projections to `whisper_saccade_example.safetensors`, and runs comparative benchmarks:
+
+**PowerShell:**
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin whisper_example
+```
+
+**Bash:**
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin whisper_example
+```
+
+---
+
+### Step 4: Running the Automated Verification Suite
+Run side-by-side correctness auditing on the compiled checkpoint:
+
+**PowerShell:**
+```powershell
+$env:RUSTFLAGS="-C target-cpu=native"
+cargo run --release --bin verify -- --checkpoint saccade_qwen.safetensors --max-tokens 30
+```
+
+**Bash:**
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin verify -- \
   --checkpoint saccade_qwen.safetensors \
   --max-tokens 30
 ```
