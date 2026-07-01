@@ -94,6 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     
     let mut run_eval = |mode_name: &str, bypass: bool| -> Result<(String, SaccadeMetrics), Box<dyn std::error::Error + Send + Sync>> {
         println!("\n--- Running in {} Mode ---", mode_name);
+        model.clear_kv_cache();
         SaccadeModelApi::set_bypass(bypass);
         SaccadeModelApi::reset_telemetry();
         
