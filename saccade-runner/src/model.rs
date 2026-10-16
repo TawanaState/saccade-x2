@@ -522,6 +522,23 @@ impl Qwen2Model {
         self.lm_head.forward(&xs)
     }
 
+    /// Teacher-forced forward pass returning logits for every position (for perplexity).
+    pub fn forward_full(&mut self, input_ids: &Tensor, offset: usize) -> Result<Tensor> {
+        let (_, seq_len) = input_ids.dims2()?;
+        let mask = if seq_len > 1 {
+            Some(self.causal_mask(seq_len, offset, &self.device)?)
+        } else {
+            None
+        };
+
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, mask.as_ref(), offset)?;
+        }
+        let xs = self.norm.forward(&xs)?;
+        self.lm_head.forward(&xs)
+    }
+
     /// Run through the first N layers and return hidden states for calibration.
     pub fn forward_calibrate(&mut self, input_ids: &Tensor, num_layers: usize) -> Result<Tensor> {
         let xs = self.embed_tokens.forward(input_ids)?;

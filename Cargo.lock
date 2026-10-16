@@ -2088,6 +2088,7 @@ dependencies = [
  "half",
  "hf-hub",
  "hound",
+ "rayon",
  "saccade-core",
  "serde",
  "serde_json",
